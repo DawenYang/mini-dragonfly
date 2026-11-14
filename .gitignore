@@ -1,0 +1,29 @@
+# Meson / Ninja build output
+build/
+build-*/
+builddir/
+subprojects/*/
+!subprojects/*.wrap
+
+# Compiled objects / binaries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# clangd / clang-tidy caches
+.cache/
+.clangd/
+
+# Editor / OS cruft
+.vscode/
+*.swp
+.DS_Store
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
