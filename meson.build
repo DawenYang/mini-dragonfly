@@ -1,10 +1,10 @@
 project('mini-dragonfly', 'cpp',
-  version : '0.1.0',
-  default_options : ['warning_level=3', 'cpp_std=c++23'])
+    version : '0.1.0',
+    default_options : ['warning_level=3', 'cpp_std=c++23'])
 
 executable('mini-dragonfly',
-           'src/main.cpp',
-           install : true)
+    'src/main.cpp',
+    install : true)
 
 catch2_dep = dependency('catch2-with-main')
 

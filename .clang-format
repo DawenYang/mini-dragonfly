@@ -1,23 +1,14 @@
 BasedOnStyle: Google
 Language: Cpp
 Standard: Latest
-
-IndentWidth: 4
 ColumnLimit: 100
-UseTab: Never
-
-AccessModifierOffset: -4
-AlignAfterOpenBracket: Align
-AllowShortFunctionsOnASingleLine: Empty
-AllowShortIfStatementsOnASingleLine: Never
-AllowShortLoopsOnASingleLine: false
-BinPackArguments: false
-BinPackParameters: false
-BreakBeforeBraces: Attach
-DerivePointerAlignment: false
+IndentWidth: 4
 PointerAlignment: Left
-ReferenceAlignment: Left
-SortIncludes: true
+DerivePointerAlignment: false
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortLoopsOnASingleLine: false
+AlignTrailingComments: true
+SpacesBeforeTrailingComments: 2
+SortIncludes: CaseSensitive
 IncludeBlocks: Regroup
-SpaceAfterTemplateKeyword: false
-NamespaceIndentation: None

@@ -12,5 +12,16 @@
       "hard_tabs": false,
       "tab_size": 4
     }
+  },
+  "lsp": {
+    "yaml-language-server": {
+      "settings": {
+        "yaml": {
+          "schemaStore": {
+            "enable": false
+          }
+        }
+      }
+    }
   }
 }
