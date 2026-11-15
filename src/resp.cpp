@@ -1,9 +1,12 @@
 #include "resp.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <string_view>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 namespace resp {
 namespace {
@@ -21,17 +24,14 @@ bool read_line(std::string_view buf, size_t pos, std::string_view& line, size_t&
     return true;
 }
 
-bool read_bounded_line(std::string_view buf, size_t pos, std::string_view& line, size_t& next_pos,
-                       Status& fail_status) {
+Status read_bounded_line(std::string_view buf, size_t pos, std::string_view& line, size_t& next_pos) {
     if (!read_line(buf, pos, line, next_pos)) {
-        fail_status = (buf.size() - pos > kMaxHeaderLineLen) ? Status::Error : Status::Incomplete;
-        return false;
+        return (buf.size() - pos > kMaxHeaderLineLen) ? Status::Error : Status::Incomplete;
     }
     if (line.size() > kMaxHeaderLineLen) {
-        fail_status = Status::Error;
-        return false;
+        return Status::Error;
     }
-    return true;
+    return Status::Ok;
 }
 
 bool to_int(std::string_view s, long long& out) {
@@ -68,7 +68,8 @@ ParseResult parse_command(std::string_view buf) {
     std::string_view line;
     size_t next_pos = 0;
 
-    if (!read_bounded_line(buf, pos, line, next_pos, result.status)) {
+    result.status = read_bounded_line(buf, pos, line, next_pos);
+    if (result.status != Status::Ok) {
         return result;
     }
 
@@ -79,10 +80,18 @@ ParseResult parse_command(std::string_view buf) {
     }
 
     pos = next_pos;
-    result.args.reserve(static_cast<size_t>(arg_count));
+
+    // First pass: validate structure and record each argument's (offset, length)
+    // without copying any bytes. A command that arrives over many small chunks
+    // gets re-validated on every call, but that's cheap arithmetic over header
+    // bytes -- unlike copying argument data, which we now only ever do once,
+    // on the call that finds the command complete.
+    std::vector<std::pair<size_t, size_t>> spans;
+    spans.reserve(std::min<size_t>(static_cast<size_t>(arg_count), (buf.size() - pos) / 6));
 
     for (long long i = 0; i < arg_count; ++i) {
-        if (!read_bounded_line(buf, pos, line, next_pos, result.status)) {
+        result.status = read_bounded_line(buf, pos, line, next_pos);
+        if (result.status != Status::Ok) {
             return result;
         }
 
@@ -110,8 +119,15 @@ ParseResult parse_command(std::string_view buf) {
             return result;
         }
 
-        result.args.emplace_back(buf.substr(pos, static_cast<size_t>(bulk_len)));
+        spans.emplace_back(pos, static_cast<size_t>(bulk_len));
         pos += required;
+    }
+
+    // Second pass: the command is confirmed complete, so now (and only now)
+    // copy the argument bytes.
+    result.args.reserve(spans.size());
+    for (const auto& [offset, length] : spans) {
+        result.args.emplace_back(buf.substr(offset, length));
     }
 
     result.status = Status::Ok;
