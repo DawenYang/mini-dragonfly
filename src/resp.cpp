@@ -14,22 +14,25 @@ constexpr long long kMaxArgCount = 1'000'000;
 constexpr long long kMaxBulkLen = 512LL * 1024 * 1024;
 constexpr size_t kMaxHeaderLineLen = 64;
 
-bool read_line(std::string_view buf, size_t pos, std::string_view& line, size_t& next_pos) {
-    const size_t crlf = buf.find("\r\n", pos);
+// Searches at most max_len + 2 bytes starting at pos, so a header with no CRLF
+// followed by megabytes of junk can't force an unbounded scan.
+bool read_line(std::string_view buf, size_t pos, size_t max_len, std::string_view& line,
+               size_t& next_pos) {
+    const size_t window_len = std::min(buf.size() - pos, max_len + 2);
+    const std::string_view window = buf.substr(pos, window_len);
+    const size_t crlf = window.find("\r\n");
     if (crlf == std::string_view::npos) {
         return false;
     }
-    line = buf.substr(pos, crlf - pos);
-    next_pos = crlf + 2;
+    line = window.substr(0, crlf);
+    next_pos = pos + crlf + 2;
     return true;
 }
 
-Status read_bounded_line(std::string_view buf, size_t pos, std::string_view& line, size_t& next_pos) {
-    if (!read_line(buf, pos, line, next_pos)) {
+Status read_bounded_line(std::string_view buf, size_t pos, std::string_view& line,
+                         size_t& next_pos) {
+    if (!read_line(buf, pos, kMaxHeaderLineLen, line, next_pos)) {
         return (buf.size() - pos > kMaxHeaderLineLen) ? Status::Error : Status::Incomplete;
-    }
-    if (line.size() > kMaxHeaderLineLen) {
-        return Status::Error;
     }
     return Status::Ok;
 }
