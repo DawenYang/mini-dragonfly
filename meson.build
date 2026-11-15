@@ -2,14 +2,21 @@ project('mini-dragonfly', 'cpp',
     version : '0.1.0',
     default_options : ['warning_level=3', 'cpp_std=c++23'])
 
+src_inc = include_directories('src')
+
 executable('mini-dragonfly',
     'src/main.cpp',
+    'src/resp.cpp',
+    include_directories : src_inc,
     install : true)
 
 catch2_dep = dependency('catch2-with-main')
 
 test_exe = executable('mini-dragonfly-tests',
     'tests/smoke_test.cpp',
+    'tests/resp_test.cpp',
+    'src/resp.cpp',
+    include_directories : src_inc,
     dependencies : catch2_dep)
 
 test('smoke', test_exe)
