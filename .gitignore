@@ -4,6 +4,7 @@ build-*/
 builddir/
 subprojects/*/
 !subprojects/*.wrap
+!subprojects/seastar/
 
 # Compiled objects / binaries
 *.o

@@ -4,6 +4,20 @@ project('mini-dragonfly', 'cpp',
 
 src_inc = include_directories('src')
 
+cmake = import('cmake')
+
+seastar_opts = cmake.subproject_options()
+seastar_opts.add_cmake_defines({
+    'CMAKE_BUILD_TYPE' : 'Release',
+    'Seastar_TESTING' : 'OFF',
+    'Seastar_APPS' : 'OFF',
+    'Seastar_DEMOS' : 'OFF',
+})
+seastar_opts.set_install(false)
+
+seastar_proj = cmake.subproject('seastar', options : seastar_opts)
+seastar_dep = seastar_proj.dependency('seastar')
+
 executable('mini-dragonfly',
     'src/main.cpp',
     'src/resp.cpp',
