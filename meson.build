@@ -41,7 +41,7 @@ seastar_opts.set_install(false)
 seastar_proj = cmake.subproject('seastar', options : seastar_opts)
 seastar_dep = seastar_proj.dependency('seastar')
 
-executable('mini-dragonfly',
+mini_dragonfly_exe = executable('mini-dragonfly',
     'src/main.cpp',
     'src/resp.cpp',
     'src/server.cpp',
@@ -60,6 +60,18 @@ test_exe = executable('mini-dragonfly-tests',
     dependencies : catch2_dep)
 
 test('smoke', test_exe)
+
+# Black-box integration tests: spawn the real compiled server as a
+# subprocess and drive it over a plain TCP socket, no Seastar needed here.
+integration_test_exe = executable('mini-dragonfly-integration-tests',
+    'tests/server_test.cpp',
+    'tests/tcp_client.cpp',
+    'tests/test_server_process.cpp',
+    dependencies : catch2_dep)
+
+test('integration', integration_test_exe,
+    env : {'MINI_DRAGONFLY_BIN' : mini_dragonfly_exe.full_path()},
+    timeout : 60)
 
 run_target('format',
     command : ['bash', '-c', 'clang-format -i src/*.cpp include/*.hpp include/*.h 2>/dev/null; true'])
