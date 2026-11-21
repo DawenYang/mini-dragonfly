@@ -6,12 +6,16 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/util/log.hh>
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <functional>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -31,6 +35,29 @@ std::string encode_bulk(const std::optional<std::string>& value) {
         return "$-1\r\n";
     }
     return "$" + std::to_string(value->size()) + "\r\n" + *value + "\r\n";
+}
+
+std::string encode_integer(long long value) { return ":" + std::to_string(value) + "\r\n"; }
+
+// Which shard owns a given key. Lives here (not in ShardStore) since it's
+// routing logic, not storage logic -- keeps ShardStore itself free of any
+// Seastar dependency so it can be unit-tested without a reactor.
+unsigned owner_shard(const std::string& key) {
+    return static_cast<unsigned>(std::hash<std::string>{}(key) % seastar::smp::count);
+}
+
+// Parses a RESP bulk-string argument as an integer. Rejects empty strings
+// and trailing junk, same contract as resp::to_int (duplicated here rather
+// than exposed from resp.cpp, since that's an internal parsing detail, not
+// part of the RESP module's public API).
+bool parse_integer_arg(const std::string& s, long long& out) {
+    if (s.empty()) {
+        return false;
+    }
+    const auto* begin = s.data();
+    const auto* end = s.data() + s.size();
+    const auto parsed = std::from_chars(begin, end, out);
+    return parsed.ec == std::errc{} && parsed.ptr == end;
 }
 
 class Connection {
@@ -100,6 +127,9 @@ private:
         if (cmd == "SET" && args.size() == 3) {
             return do_set(args[1], args[2]);
         }
+        if (cmd == "EXPIRE" && args.size() == 3) {
+            return do_expire(args[1], args[2]);
+        }
         return out_.write("-ERR unknown command or wrong number of arguments\r\n").then([this] {
             return out_.flush();
         });
@@ -119,6 +149,20 @@ private:
     seastar::future<> do_set(const std::string& key, const std::string& value) {
         return store_.invoke_on(owner_shard(key), [key, value](ShardStore& s) { s.set(key, value); })
             .then([this] { return out_.write("+OK\r\n").then([this] { return out_.flush(); }); });
+    }
+
+    seastar::future<> do_expire(const std::string& key, const std::string& seconds_str) {
+        long long seconds = 0;
+        if (!parse_integer_arg(seconds_str, seconds)) {
+            return out_.write("-ERR value is not an integer or out of range\r\n").then([this] {
+                return out_.flush();
+            });
+        }
+        return store_.invoke_on(owner_shard(key),
+                                 [key, seconds](ShardStore& s) { return s.expire(key, seconds); })
+            .then([this](bool did_set) {
+                return out_.write(encode_integer(did_set ? 1 : 0)).then([this] { return out_.flush(); });
+            });
     }
 
     seastar::connected_socket socket_;

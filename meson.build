@@ -7,17 +7,22 @@ src_inc = include_directories('src')
 cmake = import('cmake')
 
 seastar_cxx_flags = ''
-if 'thread' in get_option('b_sanitize').split(',')
-    # TSan's own runtime bootstraps during the dynamic linker's startup,
-    # before main() runs, and needs to malloc() while initializing its
-    # interceptors. Seastar globally overrides malloc/operator new with its
-    # own allocator; calling into it this early (before Seastar's own
-    # allocator state exists) crashes inside TSan's own trace code.
+if get_option('b_sanitize') != 'none'
+    # Any sanitizer's own runtime bootstraps during the dynamic linker's
+    # startup, before main() runs, and needs to malloc() while resolving
+    # symbols for its own interceptors (e.g. dlsym'ing __isoc99_printf).
+    # Seastar globally overrides malloc/operator new with its own
+    # allocator; calling into it this early, before Seastar's own
+    # allocator state exists, crashes inside the sanitizer's own runtime.
+    # This is an init-order race, not deterministic -- it happened not to
+    # trigger for a small hello-world binary under ASan, then did trigger
+    # once the real (much larger) server binary existed, so don't assume
+    # "it worked before" means it's safe for every target.
     # SEASTAR_DEFAULT_ALLOCATOR disables Seastar's custom allocator,
     # falling back to the plain system one, avoiding the clash. Seastar's
     # own CMake only defines this for its own Debug/Sanitize build types,
-    # which are tied to ASan+UBSan, not TSan, so we set it directly instead
-    # of routing through that (incompatible) machinery.
+    # which are tied to ASan+UBSan specifically, so we set it directly
+    # instead of routing through that (narrower) machinery.
     seastar_cxx_flags = '-DSEASTAR_DEFAULT_ALLOCATOR'
 endif
 
@@ -55,7 +60,9 @@ catch2_dep = dependency('catch2-with-main')
 test_exe = executable('mini-dragonfly-tests',
     'tests/smoke_test.cpp',
     'tests/resp_test.cpp',
+    'tests/store_test.cpp',
     'src/resp.cpp',
+    'src/store.cpp',
     include_directories : src_inc,
     dependencies : catch2_dep)
 

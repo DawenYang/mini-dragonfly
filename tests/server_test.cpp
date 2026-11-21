@@ -48,6 +48,40 @@ TEST_CASE("an unrecognized command gets an error reply but the connection stays 
     REQUIRE(client.recv_at_least(5) == "+OK\r\n");
 }
 
+TEST_CASE("EXPIRE on a missing key returns :0", "[server]") {
+    TestServerProcess server(kTestPort);
+    TcpClient client("127.0.0.1", kTestPort);
+
+    client.send("*3\r\n$6\r\nEXPIRE\r\n$7\r\nmissing\r\n$2\r\n10\r\n");
+    REQUIRE(client.recv_at_least(4) == ":0\r\n");
+}
+
+TEST_CASE("EXPIRE on an existing key returns :1, and a zero-second expiry takes effect",
+          "[server]") {
+    TestServerProcess server(kTestPort);
+    TcpClient client("127.0.0.1", kTestPort);
+
+    client.send("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    REQUIRE(client.recv_at_least(5) == "+OK\r\n");
+
+    client.send("*3\r\n$6\r\nEXPIRE\r\n$3\r\nfoo\r\n$1\r\n0\r\n");
+    REQUIRE(client.recv_at_least(4) == ":1\r\n");
+
+    client.send("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+    REQUIRE(client.recv_at_least(5) == "$-1\r\n");
+}
+
+TEST_CASE("EXPIRE with a non-integer seconds argument returns an error", "[server]") {
+    TestServerProcess server(kTestPort);
+    TcpClient client("127.0.0.1", kTestPort);
+
+    client.send("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    REQUIRE(client.recv_at_least(5) == "+OK\r\n");
+
+    client.send("*3\r\n$6\r\nEXPIRE\r\n$3\r\nfoo\r\n$3\r\nabc\r\n");
+    REQUIRE(client.recv_at_least(5) == "-ERR value is not an integer or out of range\r\n");
+}
+
 TEST_CASE("a malformed frame gets a protocol error and the connection closes", "[server]") {
     TestServerProcess server(kTestPort);
     TcpClient client("127.0.0.1", kTestPort);
