@@ -48,6 +48,7 @@ seastar_dep = seastar_proj.dependency('seastar')
 
 mini_dragonfly_exe = executable('mini-dragonfly',
     'src/main.cpp',
+    'src/commands.cpp',
     'src/expiry_sweeper.cpp',
     'src/resp.cpp',
     'src/server.cpp',
@@ -62,6 +63,8 @@ test_exe = executable('mini-dragonfly-tests',
     'tests/smoke_test.cpp',
     'tests/resp_test.cpp',
     'tests/store_test.cpp',
+    'tests/commands_test.cpp',
+    'src/commands.cpp',
     'src/resp.cpp',
     include_directories : src_inc,
     dependencies : catch2_dep)

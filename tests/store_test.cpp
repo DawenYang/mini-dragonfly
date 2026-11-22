@@ -238,3 +238,54 @@ TEST_CASE("sweep_expired on an empty store does nothing", "[store]") {
     FakeStore store;
     REQUIRE(store.sweep_expired() == 0);
 }
+
+// sweep_expired() is backed by an index ordered by expires_at (see
+// store.hh) rather than scanning every key, so it's only as cheap as it's
+// supposed to be if every mutation that changes or clears a key's expiry
+// keeps that index in sync. These guard specifically against a stale
+// index entry surviving a re-expire, a set() clearing a TTL, or a del() --
+// each would otherwise cost nothing today but silently reintroduce an
+// O(n) element into what should be an O(removed) sweep, or report a wrong
+// count.
+
+TEST_CASE("re-expiring a key replaces its old index entry instead of leaving it stale", "[store]") {
+    test_support::FakeClock::reset();
+    FakeStore store;
+    store.set("foo", "bar");
+    REQUIRE(store.expire("foo", 100));  // Would fire at t=100s if left alone.
+    REQUIRE(store.expire("foo", 5));    // Replaces it: now fires at t=5s.
+
+    test_support::FakeClock::advance(std::chrono::seconds(6));
+    REQUIRE(store.sweep_expired() == 1);  // The t=5s entry, found and removed.
+
+    test_support::FakeClock::advance(std::chrono::seconds(95));  // t=101s total.
+    // If the old t=100s entry had survived the re-expire above, it would
+    // show up here as a second (wrong) removal.
+    REQUIRE(store.sweep_expired() == 0);
+}
+
+TEST_CASE("set() clearing a key's TTL removes its index entry, not just its visible expiry",
+          "[store]") {
+    test_support::FakeClock::reset();
+    FakeStore store;
+    store.set("foo", "bar");
+    REQUIRE(store.expire("foo", 5));
+    store.set("foo", "baz");  // Clears the expiry.
+
+    test_support::FakeClock::advance(std::chrono::seconds(10));
+    // A surviving stale index entry would make this wrongly find and
+    // remove "foo", even though set() made it permanent again.
+    REQUIRE(store.sweep_expired() == 0);
+    REQUIRE(*store.get("foo") == "baz");
+}
+
+TEST_CASE("del() on a key with a TTL removes its index entry too", "[store]") {
+    test_support::FakeClock::reset();
+    FakeStore store;
+    store.set("foo", "bar");
+    REQUIRE(store.expire("foo", 5));
+    REQUIRE(store.del("foo"));
+
+    test_support::FakeClock::advance(std::chrono::seconds(10));
+    REQUIRE(store.sweep_expired() == 0);
+}

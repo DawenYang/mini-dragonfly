@@ -1,15 +1,16 @@
 #pragma once
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
-#include <system_error>
 #include <unordered_map>
 #include <utility>
+
+#include "parse_int.hh"
 
 namespace mini_dragonfly {
 
@@ -30,20 +31,6 @@ inline constexpr long long kMinExpirySeconds =
         .count();
 
 namespace detail {
-
-// Parses a stored value as an integer for INCR. Rejects empty strings and
-// trailing junk, same contract as server.cpp's parse_integer_arg (which
-// parses a client's incoming argument rather than a value already in the
-// store, so it's duplicated here rather than shared).
-inline bool parse_stored_integer(const std::string& s, long long& out) {
-    if (s.empty()) {
-        return false;
-    }
-    const auto* begin = s.data();
-    const auto* end = s.data() + s.size();
-    const auto parsed = std::from_chars(begin, end, out);
-    return parsed.ec == std::errc{} && parsed.ptr == end;
-}
 
 // now + seconds, saturating instead of overflowing. Clamping `seconds`
 // alone to [kMinExpirySeconds, kMaxExpirySeconds] isn't enough: those
@@ -98,7 +85,7 @@ public:
             return std::nullopt;
         }
         if (is_expired(it->second)) {
-            data_.erase(it);
+            erase_entry(it);
             return std::nullopt;
         }
         return it->second.value;
@@ -106,7 +93,14 @@ public:
 
     // A plain set always clears any previously set expiry on the key.
     void set(std::string key, std::string value) {
-        data_[std::move(key)] = Entry{std::move(value), std::nullopt};
+        auto it = data_.find(key);
+        if (it == data_.end()) {
+            data_.emplace(std::move(key), Entry{std::move(value), std::nullopt, {}});
+            return;
+        }
+        unindex_expiry(it->second);
+        it->second.value = std::move(value);
+        it->second.expires_at.reset();
     }
 
     // Sets an expiry on an existing key, seconds from now. Returns false if
@@ -120,10 +114,13 @@ public:
             return false;
         }
         if (is_expired(it->second)) {
-            data_.erase(it);
+            erase_entry(it);
             return false;
         }
-        it->second.expires_at = detail::saturating_add_seconds<Clock>(Clock::now(), seconds);
+        unindex_expiry(it->second);
+        const time_point new_expiry = detail::saturating_add_seconds<Clock>(Clock::now(), seconds);
+        it->second.expires_at = new_expiry;
+        it->second.expiry_it = expiry_index_.emplace(new_expiry, key);
         return true;
     }
 
@@ -134,7 +131,7 @@ public:
             return false;
         }
         const bool was_live = !is_expired(it->second);
-        data_.erase(it);
+        erase_entry(it);
         return was_live;
     }
 
@@ -146,7 +143,7 @@ public:
             return false;
         }
         if (is_expired(it->second)) {
-            data_.erase(it);
+            erase_entry(it);
             return false;
         }
         return true;
@@ -164,12 +161,12 @@ public:
     IncrOutcome incr(const std::string& key) {
         auto it = data_.find(key);
         if (it != data_.end() && is_expired(it->second)) {
-            data_.erase(it);
+            erase_entry(it);
             it = data_.end();
         }
 
         long long current = 0;
-        if (it != data_.end() && !detail::parse_stored_integer(it->second.value, current)) {
+        if (it != data_.end() && !parse_integer(it->second.value, current)) {
             return {IncrOutcome::Status::NotInteger};
         }
         if (current == std::numeric_limits<long long>::max()) {
@@ -180,7 +177,7 @@ public:
         if (it != data_.end()) {
             it->second.value = std::to_string(next);
         } else {
-            data_[key] = Entry{std::to_string(next), std::nullopt};
+            data_.emplace(key, Entry{std::to_string(next), std::nullopt, {}});
         }
         return {IncrOutcome::Status::Ok, next};
     }
@@ -188,34 +185,60 @@ public:
     // Actively removes every currently-expired key, rather than waiting
     // for each one to be touched again -- intended to be called
     // periodically from a background task (see ExpirySweeper), not on
-    // every request. A full scan is simple and avoids the hazard of a
-    // cursor persisted across calls: inserting into data_ between sweeps
-    // can rehash the table, which would invalidate a saved iterator.
-    // Returns how many keys were removed.
+    // every request. expiry_index_ is kept ordered by expires_at, so this
+    // only ever visits keys that have actually expired (plus one
+    // upper_bound() lookup), rather than scanning the whole keyspace --
+    // cost is O(k log n) in the number of keys removed, not the number of
+    // keys that exist. Returns how many keys were removed.
     size_t sweep_expired() {
         size_t removed = 0;
-        for (auto it = data_.begin(); it != data_.end();) {
-            if (is_expired(it->second)) {
-                it = data_.erase(it);
-                ++removed;
-            } else {
-                ++it;
-            }
+        const auto end = expiry_index_.upper_bound(Clock::now());
+        for (auto it = expiry_index_.begin(); it != end;) {
+            data_.erase(it->second);
+            it = expiry_index_.erase(it);
+            ++removed;
         }
         return removed;
     }
 
 private:
+    using ExpiryIndex = std::multimap<time_point, std::string>;
+
     struct Entry {
         std::string value;
         std::optional<time_point> expires_at;
+        // Valid (and meaningful) only when expires_at has a value -- points
+        // at this key's entry in expiry_index_, so clearing/replacing the
+        // expiry can erase it in O(log n) instead of searching for it.
+        typename ExpiryIndex::iterator expiry_it;
     };
 
     static bool is_expired(const Entry& entry) {
         return entry.expires_at.has_value() && Clock::now() >= *entry.expires_at;
     }
 
+    // Removes entry's expiry_index_ entry, if it has one. Leaves data_
+    // untouched -- callers either overwrite the expiry right after (set(),
+    // expire()) or are about to erase the whole entry (erase_entry()).
+    void unindex_expiry(Entry& entry) {
+        if (entry.expires_at.has_value()) {
+            expiry_index_.erase(entry.expiry_it);
+        }
+    }
+
+    // Removes `it` from both data_ and expiry_index_ (if it had an entry
+    // there). Used wherever a key turns out to be expired and needs
+    // reclaiming, or is being deleted outright.
+    void erase_entry(typename std::unordered_map<std::string, Entry>::iterator it) {
+        unindex_expiry(it->second);
+        data_.erase(it);
+    }
+
     std::unordered_map<std::string, Entry> data_;
+    // Ordered by expires_at so sweep_expired() can find exactly the
+    // expired keys without scanning data_. Keys with no expiry set are
+    // never indexed here at all.
+    ExpiryIndex expiry_index_;
 };
 
 using ShardStore = ShardStoreImpl<std::chrono::steady_clock>;

@@ -1,12 +1,12 @@
 #include "resp.h"
 
 #include <algorithm>
-#include <charconv>
 #include <cstddef>
 #include <string_view>
-#include <system_error>
 #include <utility>
 #include <vector>
+
+#include "parse_int.hh"
 
 namespace resp {
 namespace {
@@ -36,22 +36,6 @@ Status read_bounded_line(std::string_view buf, size_t pos, std::string_view& lin
     }
     return Status::Ok;
 }
-
-bool to_int(std::string_view s, long long& out) {
-    if (s.empty()) {
-        return false;
-    }
-
-    long long value = 0;
-    const auto* begin = s.data();
-    const auto* end = s.data() + s.size();
-    const auto parsed = std::from_chars(begin, end, value);
-    if (parsed.ec != std::errc{} || parsed.ptr != end) {
-        return false;
-    }
-    out = value;
-    return true;
-}
 }  // namespace
 
 ParseResult parse_command(std::string_view buf) {
@@ -77,7 +61,8 @@ ParseResult parse_command(std::string_view buf) {
     }
 
     long long arg_count = 0;
-    if (!to_int(line, arg_count) || arg_count < 0 || arg_count > kMaxArgCount) {
+    if (!mini_dragonfly::parse_integer(line, arg_count) || arg_count < 0 ||
+        arg_count > kMaxArgCount) {
         result.status = Status::Error;
         return result;
     }
@@ -104,7 +89,8 @@ ParseResult parse_command(std::string_view buf) {
         }
 
         long long bulk_len = 0;
-        if (!to_int(line.substr(1), bulk_len) || bulk_len < 0 || bulk_len > kMaxBulkLen) {
+        if (!mini_dragonfly::parse_integer(line.substr(1), bulk_len) || bulk_len < 0 ||
+            bulk_len > kMaxBulkLen) {
             result.status = Status::Error;
             return result;
         }

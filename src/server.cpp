@@ -1,12 +1,9 @@
 #include "server.hh"
 
 #include <algorithm>
-#include <cctype>
-#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <functional>
-#include <iterator>
 #include <optional>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
@@ -18,11 +15,11 @@
 #include <seastar/util/log.hh>
 #include <string>
 #include <string_view>
-#include <system_error>
-#include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "commands.hh"
 #include "resp.h"
 
 namespace mini_dragonfly {
@@ -35,30 +32,11 @@ constexpr auto kShutdownGracePeriod = std::chrono::seconds(2);
 constexpr auto kShutdownPollInterval = std::chrono::milliseconds(20);
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(100);
 
-std::string to_upper(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
-    return s;
-}
-
 // Which shard owns a given key. Lives here (not in ShardStore) since it's
 // routing logic, not storage logic -- keeps ShardStore itself free of any
 // Seastar dependency so it can be unit-tested without a reactor.
 unsigned owner_shard(const std::string& key) {
     return static_cast<unsigned>(std::hash<std::string>{}(key) % seastar::smp::count);
-}
-
-// Parses a RESP bulk-string argument as an integer. Rejects empty strings
-// and trailing junk, same contract as resp::to_int (duplicated here rather
-// than exposed from resp.cpp, since that's an internal parsing detail, not
-// part of the RESP module's public API).
-bool parse_integer_arg(const std::string& s, long long& out) {
-    if (s.empty()) {
-        return false;
-    }
-    const auto* begin = s.data();
-    const auto* end = s.data() + s.size();
-    const auto parsed = std::from_chars(begin, end, out);
-    return parsed.ec == std::errc{} && parsed.ptr == end;
 }
 
 }  // namespace
@@ -122,6 +100,7 @@ private:
                 buf_.erase(0, buf_pos_);
                 buf_pos_ = 0;
             }
+            // Unbounded growth point -- see buf_'s own declaration below.
             buf_.append(chunk.get(), chunk.size());
             auto result = resp::parse_command(buf_);
             if (result.status != resp::Status::Incomplete) {
@@ -163,100 +142,60 @@ private:
 
     // Every command handler takes the full command (args[0] is the command
     // name itself, already arity-checked by dispatch() against the table
-    // below) and replies on out_. Arity is "total argument count", so e.g.
-    // SET key value has min_args == max_args == 3.
-    using Handler = seastar::future<> (Connection::*)(std::vector<std::string>);
-    struct CommandSpec {
-        int min_args;
-        int max_args;  // -1 means unlimited.
-        Handler handler;
-    };
-    static const std::unordered_map<std::string, CommandSpec>& command_table();
-
+    // below) and reply on out_. The table itself, and everything about
+    // each command except how to route to a shard, lives in commands.hh --
+    // this class only parses, looks the spec up, and executes it.
     seastar::future<> dispatch(std::vector<std::string> args) {
-        const auto cmd = to_upper(args[0]);
-        const auto& table = command_table();
+        const auto cmd = commands::to_upper(args[0]);
+        const auto& table = commands::table();
         const auto it = table.find(cmd);
-        const int n = static_cast<int>(args.size());
-        if (it == table.end() || n < it->second.min_args ||
-            (it->second.max_args != -1 && n > it->second.max_args)) {
+        if (it == table.end() || !commands::arity_matches(it->second.arity, args.size())) {
             return out_.write("-ERR unknown command or wrong number of arguments\r\n");
         }
-        return (this->*it->second.handler)(std::move(args));
+        return execute(it->second, std::move(args));
     }
 
-    // None of these flush -- parse_next_command() does that once, right
-    // before it would otherwise block waiting for more input, so a
-    // pipelined batch of commands costs one flush instead of one per
-    // command. handle()'s cleanup closing out_ covers the final reply too.
-
-    // Doesn't touch the store or go cross-shard -- answered directly on
-    // whichever shard accepted the connection.
-    seastar::future<> do_ping(std::vector<std::string> args) {
-        const std::string reply =
-            args.size() == 2 ? resp::encode_bulk(std::optional(std::move(args[1]))) : "+PONG\r\n";
-        return out_.write(reply);
-    }
-
-    seastar::future<> do_echo(std::vector<std::string> args) {
-        return out_.write(resp::encode_bulk(std::optional(std::move(args[1]))));
-    }
-
-    // Routes to whichever shard owns this key via Seastar's own cross-shard
-    // messaging (sharded<T>::invoke_on, backed by smp_message_queue). If
-    // that happens to be this shard, Seastar calls through directly without
-    // going through the queue at all.
-    seastar::future<> do_get(std::vector<std::string> args) {
-        std::string& key = args[1];
-        const unsigned shard = owner_shard(key);
-        return store_.invoke_on(shard, [key = std::move(key)](ShardStore& s) { return s.get(key); })
-            .then([this](std::optional<std::string> value) {
-                return out_.write(resp::encode_bulk(value));
-            });
-    }
-
-    seastar::future<> do_set(std::vector<std::string> args) {
-        std::string& key = args[1];
-        std::string& value = args[2];
-        const unsigned shard = owner_shard(key);
-        return store_
-            .invoke_on(shard, [key = std::move(key), value = std::move(value)](
-                                  ShardStore& s) { s.set(std::move(key), std::move(value)); })
-            .then([this] { return out_.write("+OK\r\n"); });
-    }
-
-    seastar::future<> do_expire(std::vector<std::string> args) {
-        std::string& key = args[1];
-        const std::string& seconds_str = args[2];
-        long long seconds = 0;
-        if (!parse_integer_arg(seconds_str, seconds)) {
-            return out_.write("-ERR value is not an integer or out of range\r\n");
+    // Resolves this command's key(s) from spec.first_key/last_key/key_step,
+    // routes to the owning shard(s) via Seastar's own cross-shard messaging
+    // (sharded<T>::invoke_on, backed by smp_message_queue -- if a key's
+    // shard happens to be this one, Seastar calls through directly without
+    // going through the queue at all), and writes the reply. Does not
+    // flush -- parse_next_command() does that once, right before it would
+    // otherwise block waiting for more input, so a pipelined batch of
+    // commands costs one flush instead of one per command; handle()'s
+    // cleanup closing out_ covers the final reply too.
+    //
+    // A command with no keys at all (spec.first_key == 0) still goes
+    // through here, just routed to whichever shard is already running it
+    // -- so there's exactly one path below for "no keys", "one key", and
+    // "many keys", rather than a separate one per shape.
+    seastar::future<> execute(const commands::CommandSpec& spec, std::vector<std::string> args) {
+        if (const auto* handler = std::get_if<commands::Handler>(&spec.handler)) {
+            const unsigned shard = spec.first_key == 0
+                                       ? seastar::this_shard_id()
+                                       : owner_shard(args[static_cast<size_t>(spec.first_key)]);
+            const commands::Handler h = *handler;
+            return store_
+                .invoke_on(shard, [args = std::move(args),
+                                   h](ShardStore& s) mutable { return h(s, args); })
+                .then([this](std::string reply) { return out_.write(std::move(reply)); });
         }
-        if (seconds < kMinExpirySeconds || seconds > kMaxExpirySeconds) {
-            // ShardStore::expire() would clamp this safely rather than
-            // overflow, but silently treating "expire in 10^18 seconds" as
-            // "expire in ~292 years" without telling the caller is still a
-            // surprise worth rejecting outright.
-            return out_.write("-ERR invalid expire time\r\n");
-        }
-        const unsigned shard = owner_shard(key);
-        return store_
-            .invoke_on(shard, [key = std::move(key),
-                               seconds](ShardStore& s) { return s.expire(key, seconds); })
-            .then(
-                [this](bool did_set) { return out_.write(resp::encode_integer(did_set ? 1 : 0)); });
-    }
 
-    // Shared by do_del/do_exists: route each key to its owning shard in
-    // parallel, then count how many of them came back true.
-    seastar::future<> do_count_keys(std::vector<std::string> keys,
-                                    bool (ShardStore::*member)(const std::string&)) {
+        const auto multi_handler = std::get<commands::MultiKeyHandler>(spec.handler);
+        const auto first = static_cast<size_t>(spec.first_key);
+        const auto last =
+            spec.last_key == -1 ? args.size() - 1 : static_cast<size_t>(spec.last_key);
+        const auto step = static_cast<size_t>(spec.key_step);
+
         std::vector<seastar::future<bool>> futures;
-        futures.reserve(keys.size());
-        for (auto& key : keys) {
+        futures.reserve((last - first) / step + 1);
+        for (size_t i = first; i <= last; i += step) {
+            std::string key = std::move(args[i]);
             const unsigned shard = owner_shard(key);
-            futures.push_back(store_.invoke_on(
-                shard, [key = std::move(key), member](ShardStore& s) { return (s.*member)(key); }));
+            futures.push_back(
+                store_.invoke_on(shard, [key = std::move(key), multi_handler](ShardStore& s) {
+                    return multi_handler(s, key);
+                }));
         }
         return seastar::when_all_succeed(std::move(futures))
             .then([this](std::vector<bool> results) {
@@ -265,72 +204,25 @@ private:
             });
     }
 
-    seastar::future<> do_del(std::vector<std::string> args) {
-        return do_count_keys(
-            {std::make_move_iterator(args.begin() + 1), std::make_move_iterator(args.end())},
-            &ShardStore::del);
-    }
-
-    seastar::future<> do_exists(std::vector<std::string> args) {
-        return do_count_keys(
-            {std::make_move_iterator(args.begin() + 1), std::make_move_iterator(args.end())},
-            &ShardStore::exists);
-    }
-
-    seastar::future<> do_incr(std::vector<std::string> args) {
-        std::string& key = args[1];
-        const unsigned shard = owner_shard(key);
-        return store_
-            .invoke_on(shard, [key = std::move(key)](ShardStore& s) { return s.incr(key); })
-            .then([this](ShardStore::IncrOutcome outcome) {
-                if (outcome.status == ShardStore::IncrOutcome::Status::NotInteger) {
-                    return out_.write("-ERR value is not an integer or out of range\r\n");
-                }
-                if (outcome.status == ShardStore::IncrOutcome::Status::Overflow) {
-                    return out_.write("-ERR increment or decrement would overflow\r\n");
-                }
-                return out_.write(resp::encode_integer(outcome.value));
-            });
-    }
-
-    // Stubs: enough for clients/tools that probe these on connect (e.g.
-    // CLIENT SETINFO) or introspect the server (COMMAND, CONFIG GET) to
-    // get a well-formed reply, without actually implementing any of it.
-    seastar::future<> do_command(std::vector<std::string>) { return out_.write("*0\r\n"); }
-
-    seastar::future<> do_config(std::vector<std::string> args) {
-        if (args.size() >= 2 && to_upper(args[1]) == "GET") {
-            return out_.write("*0\r\n");
-        }
-        return out_.write("+OK\r\n");
-    }
-
-    seastar::future<> do_client(std::vector<std::string>) { return out_.write("+OK\r\n"); }
-
     seastar::connected_socket socket_;
     seastar::input_stream<char> in_;
     seastar::output_stream<char> out_;
     seastar::sharded<ShardStore>& store_;
+    // Unbounded: a client can declare a single bulk argument up to
+    // resp.cpp's kMaxBulkLen (512 MB), and this grows to hold it while the
+    // rest of that argument's bytes trickle in -- there's no cap here tied
+    // to connection count or total server memory, so a client willing to
+    // actually send that much data can make this connection alone hold
+    // that much. Known limitation, acceptable for this project's current
+    // scope; a deployment facing untrusted clients would want a
+    // per-connection (and/or global) memory budget enforced here,
+    // independent of resp.cpp's per-field limits.
     std::string buf_;
     // How many bytes at the front of buf_ have already been parsed into
     // commands but not yet physically erased -- see read_more_or_done().
     size_t buf_pos_ = 0;
     bool stop_ = false;
 };
-
-// Defined out-of-line since it needs Connection to already be a complete
-// type for the member-function pointers below.
-const std::unordered_map<std::string, Connection::CommandSpec>& Connection::command_table() {
-    static const std::unordered_map<std::string, CommandSpec> table = {
-        {"PING", {1, 2, &Connection::do_ping}},        {"ECHO", {2, 2, &Connection::do_echo}},
-        {"GET", {2, 2, &Connection::do_get}},          {"SET", {3, 3, &Connection::do_set}},
-        {"EXPIRE", {3, 3, &Connection::do_expire}},    {"DEL", {2, -1, &Connection::do_del}},
-        {"EXISTS", {2, -1, &Connection::do_exists}},   {"INCR", {2, 2, &Connection::do_incr}},
-        {"COMMAND", {1, -1, &Connection::do_command}}, {"CONFIG", {1, -1, &Connection::do_config}},
-        {"CLIENT", {1, -1, &Connection::do_client}},
-    };
-    return table;
-}
 
 }  // namespace detail
 
