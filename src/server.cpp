@@ -6,12 +6,14 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/util/log.hh>
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <functional>
 #include <optional>
 #include <string>
@@ -24,6 +26,9 @@ namespace mini_dragonfly {
 namespace {
 
 seastar::logger applog("server");
+
+constexpr auto kShutdownGracePeriod = std::chrono::seconds(2);
+constexpr auto kShutdownPollInterval = std::chrono::milliseconds(20);
 
 std::string to_upper(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
@@ -62,6 +67,8 @@ bool parse_integer_arg(const std::string& s, long long& out) {
 
 }  // namespace
 
+namespace detail {
+
 class Connection {
 public:
     Connection(seastar::connected_socket socket, seastar::sharded<ShardStore>& store)
@@ -69,13 +76,22 @@ public:
 
     seastar::future<> handle() {
         return seastar::do_until([this] { return stop_; }, [this] { return process_one(); })
-            .finally([this] { return out_.close(); });
+            .finally([this] { return in_.close().finally([this] { return out_.close(); }); });
     }
 
     // Aborts any read currently blocked waiting for more data from this
     // client, so a shutdown doesn't leave the connection's fiber running
     // (and reading from a store that's about to be torn down) forever.
     void shutdown_input() { socket_.shutdown_input(); }
+
+    // Used only once a shutdown's grace period has elapsed and this
+    // connection is still around -- shutdown_input() alone can't unblock a
+    // fiber that's stuck writing to a client that's stopped reading, so
+    // force both directions closed instead of waiting on it forever.
+    void force_close() {
+        socket_.shutdown_input();
+        socket_.shutdown_output();
+    }
 
 private:
     // Tries to parse a command out of whatever's already buffered. If that's
@@ -197,6 +213,10 @@ private:
     bool stop_ = false;
 };
 
+}  // namespace detail
+
+using detail::Connection;
+
 TcpServer::TcpServer(uint16_t port, seastar::sharded<ShardStore>& store) : port_(port), store_(store) {}
 
 // Declared out-of-line (rather than left implicit) so that TUs which only
@@ -209,6 +229,7 @@ void TcpServer::start() {
     seastar::listen_options lo;
     lo.reuse_address = true;
     listener_ = seastar::listen(seastar::make_ipv4_address({port_}), lo);
+    listening_ = true;
     accept_loop_done_ = accept_loop();
 }
 
@@ -233,7 +254,13 @@ seastar::future<> TcpServer::accept_loop() {
 }
 
 seastar::future<> TcpServer::stop() {
-    listener_.abort_accept();
+    // listener_ is still default-constructed (no underlying impl) if
+    // start() never got far enough to assign it -- e.g. seastar::listen()
+    // threw because the port was already taken elsewhere. Calling
+    // abort_accept() on that would dereference a null pointer.
+    if (listening_) {
+        listener_.abort_accept();
+    }
     return std::move(accept_loop_done_)
         .handle_exception([](std::exception_ptr e) {
             applog.warn("accept loop stopped with exception: {}", e);
@@ -247,7 +274,22 @@ seastar::future<> TcpServer::stop() {
             for (auto& conn : connections_) {
                 conn->shutdown_input();
             }
-            return connections_gate_.close();
+            const auto deadline = std::chrono::steady_clock::now() + kShutdownGracePeriod;
+            return seastar::do_until(
+                       [this, deadline] {
+                           return connections_.empty() || std::chrono::steady_clock::now() >= deadline;
+                       },
+                       [] { return seastar::sleep(kShutdownPollInterval); })
+                .then([this] {
+                    // shutdown_input() doesn't unblock a connection stuck
+                    // writing to a client that's stopped reading -- after
+                    // the grace period, force those closed outright rather
+                    // than let connections_gate_.close() wait forever.
+                    for (auto& conn : connections_) {
+                        conn->force_close();
+                    }
+                    return connections_gate_.close();
+                });
         });
 }
 

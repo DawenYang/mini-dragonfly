@@ -13,7 +13,9 @@
 
 namespace mini_dragonfly {
 
+namespace detail {
 class Connection;
+}  // namespace detail
 
 class TcpServer {
 public:
@@ -31,11 +33,17 @@ private:
     uint16_t port_;
     seastar::sharded<ShardStore>& store_;
     seastar::server_socket listener_;
+    // Set only once seastar::listen() in start() actually succeeds --
+    // listener_ stays default-constructed (no underlying impl) if it
+    // throws, e.g. because another process already has the port. stop()
+    // must not touch listener_ unless this is true: a default-constructed
+    // server_socket's abort_accept() dereferences a null impl pointer.
+    bool listening_ = false;
     seastar::future<> accept_loop_done_ = seastar::make_ready_future<>();
     // Tracks every connection currently being served, so stop() can
     // forcibly unblock and wait for them instead of leaving them to run
     // past shutdown against a store that's about to be torn down.
-    std::unordered_set<seastar::lw_shared_ptr<Connection>> connections_;
+    std::unordered_set<seastar::lw_shared_ptr<detail::Connection>> connections_;
     seastar::gate connections_gate_;
 };
 

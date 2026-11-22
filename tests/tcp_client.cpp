@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -10,6 +11,15 @@
 #include <stdexcept>
 
 namespace test_support {
+
+namespace {
+
+// A stuck server would otherwise hang recv_at_least() forever, surfacing
+// as the whole test binary getting killed at Meson's 60s test timeout
+// instead of a fast, specific failure here.
+constexpr int kRecvTimeoutSeconds = 10;
+
+}  // namespace
 
 TcpClient::TcpClient(const std::string& host, uint16_t port) {
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -29,6 +39,14 @@ TcpClient::TcpClient(const std::string& host, uint16_t port) {
         const int err = errno;
         ::close(fd_);
         throw std::runtime_error("connect() failed: " + std::string(std::strerror(err)));
+    }
+
+    timeval tv{};
+    tv.tv_sec = kRecvTimeoutSeconds;
+    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        const int err = errno;
+        ::close(fd_);
+        throw std::runtime_error("setsockopt(SO_RCVTIMEO) failed: " + std::string(std::strerror(err)));
     }
 }
 

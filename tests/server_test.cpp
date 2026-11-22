@@ -15,37 +15,33 @@
 using test_support::TcpClient;
 using test_support::TestServerProcess;
 
-namespace {
-constexpr uint16_t kTestPort = 17380;
-}  // namespace
-
 TEST_CASE("PING with no argument replies with +PONG", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*1\r\n$4\r\nPING\r\n");
     REQUIRE(client.recv_at_least(7) == "+PONG\r\n");
 }
 
 TEST_CASE("PING with an argument echoes it back as a bulk string", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n");
     REQUIRE(client.recv_at_least(11) == "$5\r\nhello\r\n");
 }
 
 TEST_CASE("PING with more than one argument is an error", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*3\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n");
     REQUIRE(client.recv_at_least(5) == "-ERR unknown command or wrong number of arguments\r\n");
 }
 
 TEST_CASE("SET then GET round-trips the value", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
     REQUIRE(client.recv_at_least(5) == "+OK\r\n");
@@ -55,8 +51,8 @@ TEST_CASE("SET then GET round-trips the value", "[server]") {
 }
 
 TEST_CASE("GET on a key that was never set returns $-1", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*2\r\n$3\r\nGET\r\n$7\r\nmissing\r\n");
     REQUIRE(client.recv_at_least(5) == "$-1\r\n");
@@ -64,8 +60,8 @@ TEST_CASE("GET on a key that was never set returns $-1", "[server]") {
 
 TEST_CASE("an unrecognized command gets an error reply but the connection stays open",
           "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*1\r\n$4\r\nFROB\r\n");
     REQUIRE(client.recv_at_least(5) == "-ERR unknown command or wrong number of arguments\r\n");
@@ -77,8 +73,8 @@ TEST_CASE("an unrecognized command gets an error reply but the connection stays 
 }
 
 TEST_CASE("EXPIRE on a missing key returns :0", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*3\r\n$6\r\nEXPIRE\r\n$7\r\nmissing\r\n$2\r\n10\r\n");
     REQUIRE(client.recv_at_least(4) == ":0\r\n");
@@ -86,8 +82,8 @@ TEST_CASE("EXPIRE on a missing key returns :0", "[server]") {
 
 TEST_CASE("EXPIRE on an existing key returns :1, and a zero-second expiry takes effect",
           "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
     REQUIRE(client.recv_at_least(5) == "+OK\r\n");
@@ -100,8 +96,8 @@ TEST_CASE("EXPIRE on an existing key returns :1, and a zero-second expiry takes 
 }
 
 TEST_CASE("EXPIRE with a non-integer seconds argument returns an error", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
     REQUIRE(client.recv_at_least(5) == "+OK\r\n");
@@ -112,8 +108,8 @@ TEST_CASE("EXPIRE with a non-integer seconds argument returns an error", "[serve
 
 TEST_CASE("EXPIRE with an absurdly large seconds value is rejected, not misinterpreted",
           "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
     REQUIRE(client.recv_at_least(5) == "+OK\r\n");
@@ -131,8 +127,8 @@ TEST_CASE("EXPIRE with an absurdly large seconds value is rejected, not misinter
 }
 
 TEST_CASE("shutdown closes a live, idle connection instead of hanging", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     // Deliberately leave the connection open and idle -- no request sent,
     // nothing closed from this end. Before the fix, TcpServer::stop() only
@@ -155,14 +151,15 @@ TEST_CASE(
     // client.
     constexpr unsigned kSmp = 4;
     constexpr int kWorkers = 16;
-    TestServerProcess server(kTestPort, kSmp);
+    TestServerProcess server(kSmp);
+    const uint16_t port = server.port();
 
     std::atomic<bool> stop{false};
     std::vector<std::thread> workers;
     for (int i = 0; i < kWorkers; ++i) {
-        workers.emplace_back([i, &stop] {
+        workers.emplace_back([i, port, &stop] {
             try {
-                TcpClient client("127.0.0.1", kTestPort);
+                TcpClient client("127.0.0.1", port);
                 const std::string key = "key" + std::to_string(i);
                 const std::string cmd = "*3\r\n$3\r\nSET\r\n$" + std::to_string(key.size()) +
                                          "\r\n" + key + "\r\n$3\r\nbar\r\n";
@@ -198,8 +195,8 @@ TEST_CASE(
 }
 
 TEST_CASE("a malformed frame gets a protocol error and the connection closes", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send("GARBAGE\r\n");
     REQUIRE(client.recv_at_least(5) == "-ERR protocol error\r\n");
@@ -210,8 +207,8 @@ TEST_CASE("a malformed frame gets a protocol error and the connection closes", "
 }
 
 TEST_CASE("pipelined commands on one write are each answered in order", "[server]") {
-    TestServerProcess server(kTestPort);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
 
     client.send(
         "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
@@ -223,8 +220,8 @@ TEST_CASE("GET and SET work correctly across multiple shards", "[server]") {
     // With smp > 1, different keys hash to different owning shards (see
     // owner_shard() in store.cpp). This exercises the cross-shard
     // sharded<ShardStore>::invoke_on() path, not just the single-shard case.
-    TestServerProcess server(kTestPort, /*smp=*/4);
-    TcpClient client("127.0.0.1", kTestPort);
+    TestServerProcess server(/*smp=*/4);
+    TcpClient client("127.0.0.1", server.port());
 
     const std::vector<std::pair<std::string, std::string>> pairs = {
         {"alpha", "1"}, {"bravo", "2"}, {"charlie", "3"}, {"delta", "4"}, {"echo", "5"},

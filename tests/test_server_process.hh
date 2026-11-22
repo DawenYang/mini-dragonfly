@@ -6,21 +6,30 @@
 namespace test_support {
 
 // Launches the real mini-dragonfly binary as a child process for the
-// duration of this object's lifetime, and blocks in the constructor until
-// it's actually accepting connections on the given port. Sends SIGTERM and
-// waits for a clean exit in the destructor (escalating to SIGKILL if the
-// child doesn't exit promptly).
+// duration of this object's lifetime, listening on a freshly chosen free
+// port (see port()) rather than a fixed one -- so that several instances
+// of this class can coexist, e.g. under `meson test --repeat`, which runs
+// copies of the whole test binary in parallel. A fixed port would make the
+// second copy's server fail to bind, and the first copy's tests would then
+// unknowingly talk to whichever server actually ended up listening.
+//
+// Blocks in the constructor until the server is actually accepting
+// connections on that port. Sends SIGTERM and waits for a clean exit in
+// the destructor (escalating to SIGKILL if the child doesn't exit
+// promptly).
 //
 // The binary's path is read from the MINI_DRAGONFLY_BIN environment
 // variable, which meson.build sets when registering this test so the
 // absolute build path doesn't need to be hardcoded or guessed.
 class TestServerProcess {
 public:
-    explicit TestServerProcess(uint16_t port, unsigned smp = 1);
+    explicit TestServerProcess(unsigned smp = 1);
     ~TestServerProcess();
 
     TestServerProcess(const TestServerProcess&) = delete;
     TestServerProcess& operator=(const TestServerProcess&) = delete;
+
+    uint16_t port() const noexcept { return port_; }
 
     // Sends SIGTERM and waits for the process to exit, escalating to
     // SIGKILL if it doesn't within a grace period. Returns true if it
@@ -36,6 +45,7 @@ public:
     std::string read_log() const;
 
 private:
+    uint16_t port_ = 0;
     int pid_ = -1;
     std::string log_path_;
 };

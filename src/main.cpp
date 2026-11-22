@@ -6,7 +6,10 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/util/closeable.hh>
 #include <seastar/util/log.hh>
+
+#include <exception>
 
 namespace {
 
@@ -28,17 +31,30 @@ int main(int argc, char** argv) {
 
             seastar::sharded<mini_dragonfly::ShardStore> store;
             store.start().get();
+            auto stop_store = seastar::deferred_stop(store);
 
             seastar::sharded<mini_dragonfly::TcpServer> server;
             server.start(port, std::ref(store)).get();
-            server.invoke_on_all(&mini_dragonfly::TcpServer::start).get();
+            auto stop_server = seastar::deferred_stop(server);
+
+            // invoke_on_all's start() calls seastar::listen() on every
+            // shard; if the port is already taken, that throws. Without
+            // this, the exception unwound straight out of this seastar
+            // thread and left the process stuck rather than exiting --
+            // the deferred_stop guards above still run during that
+            // unwinding, but nothing turned the failure into a visible
+            // log line and a non-zero exit.
+            try {
+                server.invoke_on_all(&mini_dragonfly::TcpServer::start).get();
+            } catch (...) {
+                applog.error("failed to listen on port {}: {}", port, std::current_exception());
+                return 1;
+            }
             applog.info("listening on port {} across {} shard(s)", port, seastar::smp::count);
 
             stop_signal.wait().get();
-
             applog.info("shutting down");
-            server.stop().get();
-            store.stop().get();
+            return 0;
         });
     });
 }
