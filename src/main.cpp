@@ -1,7 +1,5 @@
-#include "server.hh"
-#include "stop_signal.hh"
-#include "store.hh"
-
+#include <chrono>
+#include <exception>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
@@ -9,19 +7,24 @@
 #include <seastar/util/closeable.hh>
 #include <seastar/util/log.hh>
 
-#include <exception>
+#include "expiry_sweeper.hh"
+#include "server.hh"
+#include "stop_signal.hh"
+#include "store.hh"
 
 namespace {
 
 seastar::logger applog("main");
 constexpr uint16_t kDefaultPort = 6380;
+constexpr auto kExpirySweepInterval = std::chrono::milliseconds(100);
 
 }  // namespace
 
 int main(int argc, char** argv) {
     seastar::app_template app;
-    app.add_options()("port", boost::program_options::value<uint16_t>()->default_value(kDefaultPort),
-                       "TCP port to listen on");
+    app.add_options()("port",
+                      boost::program_options::value<uint16_t>()->default_value(kDefaultPort),
+                      "TCP port to listen on");
 
     return app.run(argc, argv, [&app] {
         return seastar::async([&app] {
@@ -32,6 +35,14 @@ int main(int argc, char** argv) {
             seastar::sharded<mini_dragonfly::ShardStore> store;
             store.start().get();
             auto stop_store = seastar::deferred_stop(store);
+
+            // Declared (and so, on the way out, stopped) after store but
+            // before server: shutdown order is server, then sweeper, then
+            // store -- stopping the connection-handling and the periodic
+            // sweep before the store they both call into is torn down.
+            mini_dragonfly::ExpirySweeper sweeper(store, kExpirySweepInterval);
+            sweeper.start();
+            auto stop_sweeper = seastar::deferred_stop(sweeper);
 
             seastar::sharded<mini_dragonfly::TcpServer> server;
             server.start(port, std::ref(store)).get();

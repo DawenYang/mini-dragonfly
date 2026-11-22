@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,5 +31,12 @@ struct ParseResult {
 };
 
 ParseResult parse_command(std::string_view buf);
+
+// Encodes a RESP bulk string reply, or the null bulk string ("$-1\r\n") if
+// value is empty.
+std::string encode_bulk(const std::optional<std::string>& value);
+
+// Encodes a RESP integer reply.
+std::string encode_integer(long long value);
 
 }  // namespace resp

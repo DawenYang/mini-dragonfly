@@ -1,11 +1,10 @@
 #include "test_server_process.hh"
 
-#include "tcp_client.hh"
-
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -18,6 +17,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#include "tcp_client.hh"
 
 namespace test_support {
 
@@ -33,7 +34,7 @@ constexpr auto kShutdownPollInterval = std::chrono::milliseconds(20);
 // between this and the real server binding that same port a moment later
 // -- see the something_listening() check right after this is called.
 uint16_t find_free_port() {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         throw std::runtime_error("socket() failed: " + std::string(std::strerror(errno)));
     }
@@ -56,7 +57,7 @@ uint16_t find_free_port() {
 }
 
 bool something_listening(uint16_t port) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         throw std::runtime_error("socket() failed: " + std::string(std::strerror(errno)));
     }
@@ -80,7 +81,7 @@ void wait_until_accepting(uint16_t port) {
         }
     }
     throw std::runtime_error("server did not start accepting connections on port " +
-                              std::to_string(port) + " within the timeout");
+                             std::to_string(port) + " within the timeout");
 }
 
 std::string make_log_path() {
@@ -95,7 +96,7 @@ std::string make_log_path() {
 
 }  // namespace
 
-TestServerProcess::TestServerProcess(unsigned smp)
+TestServerProcess::TestServerProcess(unsigned smp, std::optional<unsigned> fd_limit)
     : port_(find_free_port()), log_path_(make_log_path()) {
     if (something_listening(port_)) {
         // The bind-then-close/exec window above raced with something else
@@ -103,8 +104,8 @@ TestServerProcess::TestServerProcess(unsigned smp)
         // letting wait_until_accepting() below connect to that something
         // else and have the test talk to the wrong server.
         throw std::runtime_error("port " + std::to_string(port_) +
-                                  " is unexpectedly already in use right before starting "
-                                  "the test server");
+                                 " is unexpectedly already in use right before starting "
+                                 "the test server");
     }
 
     const char* bin_path = std::getenv("MINI_DRAGONFLY_BIN");
@@ -123,7 +124,12 @@ TestServerProcess::TestServerProcess(unsigned smp)
     if (pid == 0) {
         // Child: quiet the server's own stdout (unused) and capture its
         // stderr (where its seastar::logger output goes) to log_path_
-        // instead of letting it interleave with Catch2's own output.
+        // instead of letting it interleave with Catch2's own output. Done
+        // before fd_limit is applied below -- these two small allocations
+        // must not compete for the same tight budget fd_limit means to
+        // impose on the server itself (e.g. under ASan, this process can
+        // start with a couple of extra non-CLOEXEC fds already inherited
+        // from the parent, leaving little headroom otherwise).
         const int devnull = ::open("/dev/null", O_WRONLY);
         if (devnull >= 0) {
             ::dup2(devnull, STDOUT_FILENO);
@@ -134,6 +140,16 @@ TestServerProcess::TestServerProcess(unsigned smp)
             ::dup2(log_fd, STDERR_FILENO);
             ::close(log_fd);
         }
+
+        if (fd_limit) {
+            rlimit rl{};
+            rl.rlim_cur = *fd_limit;
+            rl.rlim_max = *fd_limit;
+            if (::setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+                ::_exit(127);
+            }
+        }
+
         ::execl(bin_path, bin_path, "--port", port_str.c_str(), "--smp", smp_str.c_str(),
                 static_cast<char*>(nullptr));
         // execl only returns on failure.

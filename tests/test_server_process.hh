@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace test_support {
@@ -23,7 +24,11 @@ namespace test_support {
 // absolute build path doesn't need to be hardcoded or guessed.
 class TestServerProcess {
 public:
-    explicit TestServerProcess(unsigned smp = 1);
+    // fd_limit, if set, caps the child's RLIMIT_NOFILE before it execs --
+    // used to deterministically provoke an EMFILE/ENFILE from accept()
+    // under test, rather than needing to actually exhaust the real
+    // process's file descriptors.
+    explicit TestServerProcess(unsigned smp = 1, std::optional<unsigned> fd_limit = std::nullopt);
     ~TestServerProcess();
 
     TestServerProcess(const TestServerProcess&) = delete;

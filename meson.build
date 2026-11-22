@@ -48,9 +48,9 @@ seastar_dep = seastar_proj.dependency('seastar')
 
 mini_dragonfly_exe = executable('mini-dragonfly',
     'src/main.cpp',
+    'src/expiry_sweeper.cpp',
     'src/resp.cpp',
     'src/server.cpp',
-    'src/store.cpp',
     include_directories : src_inc,
     dependencies : seastar_dep,
     install : true)
@@ -63,7 +63,6 @@ test_exe = executable('mini-dragonfly-tests',
     'tests/resp_test.cpp',
     'tests/store_test.cpp',
     'src/resp.cpp',
-    'src/store.cpp',
     include_directories : src_inc,
     dependencies : catch2_dep)
 
@@ -71,10 +70,15 @@ test('smoke', test_exe)
 
 # Black-box integration tests: spawn the real compiled server as a
 # subprocess and drive it over a plain TCP socket, no Seastar needed here.
+#
+# MINI_DRAGONFLY_UNDER_SANITIZER lets a test case detect a sanitizer build
+# of the *server* binary it's about to spawn and skip itself if needed --
+# see its use for the accept()-failure test in server_test.cpp.
 integration_test_exe = executable('mini-dragonfly-integration-tests',
     'tests/server_test.cpp',
     'tests/tcp_client.cpp',
     'tests/test_server_process.cpp',
+    cpp_args : get_option('b_sanitize') != 'none' ? ['-DMINI_DRAGONFLY_UNDER_SANITIZER'] : [],
     dependencies : [catch2_dep, threads_dep])
 
 test('integration', integration_test_exe,

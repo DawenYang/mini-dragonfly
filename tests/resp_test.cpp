@@ -2,10 +2,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+using resp::encode_bulk;
+using resp::encode_integer;
 using resp::parse_command;
 using resp::Status;
 
@@ -52,8 +55,7 @@ TEST_CASE("parses an empty bulk string as a single empty arg", "[resp]") {
     REQUIRE(result.args == std::vector<std::string>{""});
 }
 
-TEST_CASE("pipelined commands are parsed one at a time by advancing past consumed",
-          "[resp]") {
+TEST_CASE("pipelined commands are parsed one at a time by advancing past consumed", "[resp]") {
     const std::string first = "*1\r\n$4\r\nPING\r\n";
     const std::string second = "*1\r\n$4\r\nPONG\r\n";
     const std::string buf = first + second;
@@ -199,4 +201,25 @@ TEST_CASE("oversized header lines are rejected outright, not held as incomplete"
         const std::string buf = "*1\r\n$" + std::string(100, '9');
         require_empty_result(parse_command(buf), Status::Error);
     }
+}
+
+TEST_CASE("encode_bulk on a value encodes it as a RESP bulk string", "[resp]") {
+    REQUIRE(encode_bulk(std::optional<std::string>("bar")) == "$3\r\nbar\r\n");
+}
+
+TEST_CASE("encode_bulk on an empty string still encodes a (zero-length) bulk string", "[resp]") {
+    REQUIRE(encode_bulk(std::optional<std::string>("")) == "$0\r\n\r\n");
+}
+
+TEST_CASE("encode_bulk on nullopt encodes the null bulk string", "[resp]") {
+    REQUIRE(encode_bulk(std::nullopt) == "$-1\r\n");
+}
+
+TEST_CASE("encode_integer encodes a RESP integer reply", "[resp]") {
+    REQUIRE(encode_integer(42) == ":42\r\n");
+}
+
+TEST_CASE("encode_integer handles zero and negative values", "[resp]") {
+    REQUIRE(encode_integer(0) == ":0\r\n");
+    REQUIRE(encode_integer(-7) == ":-7\r\n");
 }

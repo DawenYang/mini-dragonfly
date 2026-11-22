@@ -39,6 +39,11 @@ private:
     // must not touch listener_ unless this is true: a default-constructed
     // server_socket's abort_accept() dereferences a null impl pointer.
     bool listening_ = false;
+    // Set just before abort_accept() in stop(), so accept_loop() can tell
+    // a deliberate shutdown cancellation apart from a transient accept()
+    // failure (e.g. EMFILE) that should be logged and retried instead of
+    // killing the loop for good.
+    bool stopping_ = false;
     seastar::future<> accept_loop_done_ = seastar::make_ready_future<>();
     // Tracks every connection currently being served, so stop() can
     // forcibly unblock and wait for them instead of leaving them to run

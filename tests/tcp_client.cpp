@@ -22,7 +22,10 @@ constexpr int kRecvTimeoutSeconds = 10;
 }  // namespace
 
 TcpClient::TcpClient(const std::string& host, uint16_t port) {
-    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    // SOCK_CLOEXEC: without it, this fd would survive into any process this
+    // test binary later fork()s+exec()s (e.g. TestServerProcess's server),
+    // silently eating into that process's own fd budget.
+    fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd_ < 0) {
         throw std::runtime_error("socket() failed: " + std::string(std::strerror(errno)));
     }
@@ -46,7 +49,8 @@ TcpClient::TcpClient(const std::string& host, uint16_t port) {
     if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
         const int err = errno;
         ::close(fd_);
-        throw std::runtime_error("setsockopt(SO_RCVTIMEO) failed: " + std::string(std::strerror(err)));
+        throw std::runtime_error("setsockopt(SO_RCVTIMEO) failed: " +
+                                 std::string(std::strerror(err)));
     }
 }
 

@@ -137,4 +137,16 @@ ParseResult parse_command(std::string_view buf) {
     result.consumed = pos;
     return result;
 }
+
+std::string encode_bulk(const std::optional<std::string>& value) {
+    if (!value) {
+        return "$-1\r\n";
+    }
+    return "$" + std::to_string(value->size()) + "\r\n" + *value + "\r\n";
+}
+
+std::string encode_integer(long long value) {
+    return ":" + std::to_string(value) + "\r\n";
+}
+
 }  // namespace resp
