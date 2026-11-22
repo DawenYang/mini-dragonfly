@@ -9,6 +9,8 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,9 +38,19 @@ void wait_until_accepting(uint16_t port) {
                               std::to_string(port) + " within the timeout");
 }
 
+std::string make_log_path() {
+    std::string tmpl = "/tmp/mini-dragonfly-test-log-XXXXXX";
+    const int fd = ::mkstemp(tmpl.data());
+    if (fd < 0) {
+        throw std::runtime_error("mkstemp() failed");
+    }
+    ::close(fd);
+    return tmpl;
+}
+
 }  // namespace
 
-TestServerProcess::TestServerProcess(uint16_t port, unsigned smp) {
+TestServerProcess::TestServerProcess(uint16_t port, unsigned smp) : log_path_(make_log_path()) {
     const char* bin_path = std::getenv("MINI_DRAGONFLY_BIN");
     if (bin_path == nullptr) {
         throw std::runtime_error("MINI_DRAGONFLY_BIN is not set");
@@ -53,13 +65,18 @@ TestServerProcess::TestServerProcess(uint16_t port, unsigned smp) {
     }
 
     if (pid == 0) {
-        // Child: quiet the server's own log output so it doesn't interleave
-        // with Catch2's own test output, then exec the real binary.
+        // Child: quiet the server's own stdout (unused) and capture its
+        // stderr (where its seastar::logger output goes) to log_path_
+        // instead of letting it interleave with Catch2's own output.
         const int devnull = ::open("/dev/null", O_WRONLY);
         if (devnull >= 0) {
             ::dup2(devnull, STDOUT_FILENO);
-            ::dup2(devnull, STDERR_FILENO);
             ::close(devnull);
+        }
+        const int log_fd = ::open(log_path_.c_str(), O_WRONLY | O_TRUNC);
+        if (log_fd >= 0) {
+            ::dup2(log_fd, STDERR_FILENO);
+            ::close(log_fd);
         }
         ::execl(bin_path, bin_path, "--port", port_str.c_str(), "--smp", smp_str.c_str(),
                 static_cast<char*>(nullptr));
@@ -71,27 +88,42 @@ TestServerProcess::TestServerProcess(uint16_t port, unsigned smp) {
     wait_until_accepting(port);
 }
 
-TestServerProcess::~TestServerProcess() {
+bool TestServerProcess::shutdown_and_wait() {
     if (pid_ < 0) {
-        return;
+        return true;
     }
+    const pid_t pid = pid_;
+    pid_ = -1;
 
-    ::kill(pid_, SIGTERM);
+    ::kill(pid, SIGTERM);
 
     const auto deadline = std::chrono::steady_clock::now() + kShutdownGrace;
     while (std::chrono::steady_clock::now() < deadline) {
         int status = 0;
-        const pid_t r = ::waitpid(pid_, &status, WNOHANG);
-        if (r == pid_) {
-            return;  // Exited cleanly (or at least, exited).
+        const pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            return true;
         }
         std::this_thread::sleep_for(kShutdownPollInterval);
     }
 
     // Didn't exit in time -- force it and reap unconditionally.
-    ::kill(pid_, SIGKILL);
+    ::kill(pid, SIGKILL);
     int status = 0;
-    ::waitpid(pid_, &status, 0);
+    ::waitpid(pid, &status, 0);
+    return false;
+}
+
+TestServerProcess::~TestServerProcess() {
+    shutdown_and_wait();
+    ::unlink(log_path_.c_str());
+}
+
+std::string TestServerProcess::read_log() const {
+    std::ifstream f(log_path_);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
 }
 
 }  // namespace test_support

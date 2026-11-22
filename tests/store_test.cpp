@@ -67,3 +67,24 @@ TEST_CASE("set clears any previously set expiry", "[store]") {
     store.set("foo", "baz");         // A fresh SET should un-expire it.
     REQUIRE(*store.get("foo") == "baz");
 }
+
+TEST_CASE("an absurdly large expiry is clamped instead of overflowing into the past",
+          "[store]") {
+    ShardStore store;
+    store.set("foo", "bar");
+    // Large enough that seconds * 1e9 (steady_clock's typical nanosecond
+    // resolution) overflows int64_t and wraps to a point in the past if
+    // not clamped -- this exact value previously made the key expire
+    // immediately instead of ~292 years from now.
+    REQUIRE(store.expire("foo", 9223372037LL));
+    REQUIRE(*store.get("foo") == "bar");
+}
+
+TEST_CASE("an absurdly negative expiry is clamped rather than underflowing", "[store]") {
+    ShardStore store;
+    store.set("foo", "bar");
+    // Still expires immediately (any clamp result here is far in the
+    // past), but must not crash or produce UB computing it.
+    REQUIRE(store.expire("foo", -9223372037LL));
+    REQUIRE_FALSE(store.get("foo").has_value());
+}

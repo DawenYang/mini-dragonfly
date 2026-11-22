@@ -60,6 +60,8 @@ bool parse_integer_arg(const std::string& s, long long& out) {
     return parsed.ec == std::errc{} && parsed.ptr == end;
 }
 
+}  // namespace
+
 class Connection {
 public:
     Connection(seastar::connected_socket socket, seastar::sharded<ShardStore>& store)
@@ -69,6 +71,11 @@ public:
         return seastar::do_until([this] { return stop_; }, [this] { return process_one(); })
             .finally([this] { return out_.close(); });
     }
+
+    // Aborts any read currently blocked waiting for more data from this
+    // client, so a shutdown doesn't leave the connection's fiber running
+    // (and reading from a store that's about to be torn down) forever.
+    void shutdown_input() { socket_.shutdown_input(); }
 
 private:
     // Tries to parse a command out of whatever's already buffered. If that's
@@ -121,6 +128,9 @@ private:
 
     seastar::future<> dispatch(std::vector<std::string> args) {
         auto cmd = to_upper(args[0]);
+        if (cmd == "PING" && args.size() <= 2) {
+            return do_ping(args.size() == 2 ? std::optional(args[1]) : std::nullopt);
+        }
         if (cmd == "GET" && args.size() == 2) {
             return do_get(args[1]);
         }
@@ -133,6 +143,13 @@ private:
         return out_.write("-ERR unknown command or wrong number of arguments\r\n").then([this] {
             return out_.flush();
         });
+    }
+
+    // Doesn't touch the store or go cross-shard -- answered directly on
+    // whichever shard accepted the connection.
+    seastar::future<> do_ping(std::optional<std::string> message) {
+        const std::string reply = message ? encode_bulk(message) : "+PONG\r\n";
+        return out_.write(reply).then([this] { return out_.flush(); });
     }
 
     // Routes to whichever shard owns this key via Seastar's own cross-shard
@@ -158,6 +175,13 @@ private:
                 return out_.flush();
             });
         }
+        if (seconds < kMinExpirySeconds || seconds > kMaxExpirySeconds) {
+            // ShardStore::expire() would clamp this safely rather than
+            // overflow, but silently treating "expire in 10^18 seconds" as
+            // "expire in ~292 years" without telling the caller is still a
+            // surprise worth rejecting outright.
+            return out_.write("-ERR invalid expire time\r\n").then([this] { return out_.flush(); });
+        }
         return store_.invoke_on(owner_shard(key),
                                  [key, seconds](ShardStore& s) { return s.expire(key, seconds); })
             .then([this](bool did_set) {
@@ -173,9 +197,13 @@ private:
     bool stop_ = false;
 };
 
-}  // namespace
-
 TcpServer::TcpServer(uint16_t port, seastar::sharded<ShardStore>& store) : port_(port), store_(store) {}
+
+// Declared out-of-line (rather than left implicit) so that TUs which only
+// see the Connection forward declaration in server.hh -- e.g. main.cpp,
+// where sharded<TcpServer> destroys per-shard instances -- don't need
+// Connection to be a complete type.
+TcpServer::~TcpServer() = default;
 
 void TcpServer::start() {
     seastar::listen_options lo;
@@ -190,18 +218,37 @@ seastar::future<> TcpServer::accept_loop() {
             applog.info("accepted connection from {} on shard {}", ar.remote_address,
                         seastar::this_shard_id());
             auto conn = seastar::make_lw_shared<Connection>(std::move(ar.connection), store_);
-            (void)conn->handle().handle_exception([conn](std::exception_ptr e) {
-                applog.warn("connection terminated with exception: {}", e);
-            });
+            connections_.insert(conn);
+            connections_gate_.enter();
+            (void)conn->handle()
+                .handle_exception([conn](std::exception_ptr e) {
+                    applog.warn("connection terminated with exception: {}", e);
+                })
+                .finally([this, conn] {
+                    connections_.erase(conn);
+                    connections_gate_.leave();
+                });
         });
     });
 }
 
 seastar::future<> TcpServer::stop() {
     listener_.abort_accept();
-    return std::move(accept_loop_done_).handle_exception([](std::exception_ptr e) {
-        applog.warn("accept loop stopped with exception: {}", e);
-    });
+    return std::move(accept_loop_done_)
+        .handle_exception([](std::exception_ptr e) {
+            applog.warn("accept loop stopped with exception: {}", e);
+        })
+        .then([this] {
+            // Unblock any connection currently blocked waiting for more
+            // data from its client -- shutdown_input() makes a pending (or
+            // future) read fail immediately instead of leaving the
+            // connection's fiber running past shutdown, still able to call
+            // into a store that's about to be torn down.
+            for (auto& conn : connections_) {
+                conn->shutdown_input();
+            }
+            return connections_gate_.close();
+        });
 }
 
 }  // namespace mini_dragonfly

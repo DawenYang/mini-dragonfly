@@ -7,6 +7,22 @@
 
 namespace mini_dragonfly {
 
+// The largest and smallest number of seconds that can be added to
+// steady_clock::now() without overflowing its underlying (nanosecond,
+// typically) representation. A seconds value outside this range, once
+// converted to that finer resolution, wraps around to a garbage time
+// point -- often one that's already in the past, making expire() with a
+// huge value expire the key immediately instead of leaving it alone.
+// ShardStore::expire() clamps to this range internally so it can never
+// misbehave; callers validating user input may prefer to reject values
+// outside it outright instead (see server.cpp's do_expire()).
+inline constexpr long long kMaxExpirySeconds =
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::duration::max())
+        .count();
+inline constexpr long long kMinExpirySeconds =
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::duration::min())
+        .count();
+
 // Owns one disjoint slice of the keyspace. Only ever touched by the one
 // shard it lives on (via seastar::sharded<ShardStore>), so no locking.
 // Pure C++ with no Seastar dependency, so it can be unit-tested directly.
@@ -21,7 +37,9 @@ public:
 
     // Sets an expiry on an existing key, seconds from now. Returns false if
     // the key doesn't exist (or was already expired). A non-positive
-    // seconds value expires the key immediately.
+    // seconds value expires the key immediately. Values outside
+    // [kMinExpirySeconds, kMaxExpirySeconds] are clamped rather than
+    // overflowing.
     bool expire(const std::string& key, long long seconds);
 
 private:

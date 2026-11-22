@@ -41,7 +41,11 @@ TcpClient::~TcpClient() {
 void TcpClient::send(std::string_view data) {
     size_t sent = 0;
     while (sent < data.size()) {
-        const ssize_t n = ::send(fd_, data.data() + sent, data.size() - sent, 0);
+        // MSG_NOSIGNAL: writing to a connection the peer has already reset
+        // would otherwise raise SIGPIPE, whose default disposition kills
+        // the whole process -- not just this call -- rather than letting
+        // send() fail with EPIPE the normal way.
+        const ssize_t n = ::send(fd_, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
         if (n <= 0) {
             throw std::runtime_error("send() failed: " + std::string(std::strerror(errno)));
         }

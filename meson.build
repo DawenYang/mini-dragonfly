@@ -56,6 +56,7 @@ mini_dragonfly_exe = executable('mini-dragonfly',
     install : true)
 
 catch2_dep = dependency('catch2-with-main')
+threads_dep = dependency('threads')
 
 test_exe = executable('mini-dragonfly-tests',
     'tests/smoke_test.cpp',
@@ -74,7 +75,7 @@ integration_test_exe = executable('mini-dragonfly-integration-tests',
     'tests/server_test.cpp',
     'tests/tcp_client.cpp',
     'tests/test_server_process.cpp',
-    dependencies : catch2_dep)
+    dependencies : [catch2_dep, threads_dep])
 
 test('integration', integration_test_exe,
     env : {'MINI_DRAGONFLY_BIN' : mini_dragonfly_exe.full_path()},
