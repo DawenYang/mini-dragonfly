@@ -149,8 +149,11 @@ private:
         const auto cmd = commands::to_upper(args[0]);
         const auto& table = commands::table();
         const auto it = table.find(cmd);
-        if (it == table.end() || !commands::arity_matches(it->second.arity, args.size())) {
-            return out_.write("-ERR unknown command or wrong number of arguments\r\n");
+        if (it == table.end()) {
+            return out_.write(commands::unknown_command_error(args[0]));
+        }
+        if (!commands::arity_matches(it->second.arity, args.size())) {
+            return out_.write(commands::wrong_arity_error(args[0]));
         }
         return execute(it->second, std::move(args));
     }

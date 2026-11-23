@@ -36,7 +36,7 @@ TEST_CASE("PING with more than one argument is an error", "[server]") {
     TcpClient client("127.0.0.1", server.port());
 
     client.send("*3\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n");
-    REQUIRE(client.recv_at_least(5) == "-ERR unknown command or wrong number of arguments\r\n");
+    REQUIRE(client.recv_at_least(5) == "-ERR wrong number of arguments for 'ping' command\r\n");
 }
 
 TEST_CASE("ECHO replies with its argument as a bulk string", "[server]") {
@@ -52,7 +52,7 @@ TEST_CASE("ECHO with no argument is an error", "[server]") {
     TcpClient client("127.0.0.1", server.port());
 
     client.send("*1\r\n$4\r\nECHO\r\n");
-    REQUIRE(client.recv_at_least(5) == "-ERR unknown command or wrong number of arguments\r\n");
+    REQUIRE(client.recv_at_least(5) == "-ERR wrong number of arguments for 'echo' command\r\n");
 }
 
 TEST_CASE("DEL on a missing key returns :0", "[server]") {
@@ -216,7 +216,7 @@ TEST_CASE("an unrecognized command gets an error reply but the connection stays 
     TcpClient client("127.0.0.1", server.port());
 
     client.send("*1\r\n$4\r\nFROB\r\n");
-    REQUIRE(client.recv_at_least(5) == "-ERR unknown command or wrong number of arguments\r\n");
+    REQUIRE(client.recv_at_least(5) == "-ERR unknown command 'FROB'\r\n");
 
     // The connection should still be usable afterward -- an unknown command
     // isn't a protocol error, it just doesn't match anything.

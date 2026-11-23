@@ -1,9 +1,8 @@
 #pragma once
 
+#include <csignal>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/signal.hh>
-
-#include <csignal>
 
 namespace mini_dragonfly {
 

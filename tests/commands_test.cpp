@@ -12,6 +12,8 @@ using mini_dragonfly::commands::LockMode;
 using mini_dragonfly::commands::MultiKeyHandler;
 using mini_dragonfly::commands::table;
 using mini_dragonfly::commands::to_upper;
+using mini_dragonfly::commands::unknown_command_error;
+using mini_dragonfly::commands::wrong_arity_error;
 
 namespace {
 
@@ -108,7 +110,7 @@ TEST_CASE("PING with more than one argument is an error", "[commands]") {
     // commands.cpp.
     ShardStore store;
     REQUIRE(run("PING", {"PING", "a", "b"}, store) ==
-            "-ERR unknown command or wrong number of arguments\r\n");
+            "-ERR wrong number of arguments for 'ping' command\r\n");
 }
 
 TEST_CASE("ECHO replies with its argument as a bulk string", "[commands]") {
@@ -208,4 +210,43 @@ TEST_CASE("CONFIG SET replies with +OK", "[commands]") {
 TEST_CASE("CLIENT subcommands reply with +OK", "[commands]") {
     ShardStore store;
     REQUIRE(run("CLIENT", {"CLIENT", "SETINFO", "lib-name", "x"}, store) == "+OK\r\n");
+}
+
+TEST_CASE("every keyed table entry has a key_step of at least 1", "[commands]") {
+    // execute() advances through multi-key args by key_step; 0 would loop
+    // forever.
+    for (const auto& [name, spec] : table()) {
+        if (spec.first_key != 0) {
+            INFO(name);
+            REQUIRE(spec.key_step >= 1);
+        }
+    }
+}
+
+TEST_CASE("every table entry's key range and handler alternative agree", "[commands]") {
+    for (const auto& [name, spec] : table()) {
+        INFO(name);
+        if (spec.first_key == 0) {
+            REQUIRE(std::holds_alternative<Handler>(spec.handler));
+        } else if (spec.last_key == -1) {
+            REQUIRE(std::holds_alternative<MultiKeyHandler>(spec.handler));
+        } else {
+            REQUIRE(spec.last_key >= spec.first_key);
+            REQUIRE(std::holds_alternative<Handler>(spec.handler));
+        }
+    }
+}
+
+TEST_CASE("error replies match what Redis clients expect", "[commands]") {
+    REQUIRE(unknown_command_error("foo") == "-ERR unknown command 'foo'\r\n");
+    REQUIRE(wrong_arity_error("GeT") == "-ERR wrong number of arguments for 'get' command\r\n");
+}
+
+TEST_CASE("error replies can't be broken by CR/LF or huge names in the echoed command name",
+          "[commands]") {
+    const std::string reply = unknown_command_error("a\r\n+OK\r\nb");
+    REQUIRE(reply == "-ERR unknown command 'a  +OK  b'\r\n");
+
+    const std::string long_reply = unknown_command_error(std::string(100000, 'x'));
+    REQUIRE(long_reply.size() < 200);
 }

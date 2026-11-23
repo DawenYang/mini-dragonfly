@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -54,10 +55,10 @@ struct CommandSpec {
     // Exactly one of these is active: Handler for a command with at most
     // one key (first_key == 0, or first_key == last_key), MultiKeyHandler
     // for one with a variable-length list of them (last_key == -1). The
-    // executor (Connection::execute() in server.cpp) picks the right path
-    // from CommandSpec's own first_key/last_key, not from which
-    // alternative happens to be engaged -- so single-key and multi-key
-    // commands are routed by the same code either way.
+    // executor (Connection::execute() in server.cpp) picks its path from
+    // which alternative is engaged, and uses first_key/last_key/key_step
+    // to find the keys -- so the two must agree, which commands_test.cpp
+    // checks for every table entry.
     std::variant<Handler, MultiKeyHandler> handler;
 };
 
@@ -69,5 +70,11 @@ const std::unordered_map<std::string, CommandSpec>& table();
 bool arity_matches(int arity, size_t n);
 
 std::string to_upper(std::string s);
+
+// Complete RESP error replies, matching what Redis clients expect. Both
+// echo a client-supplied command name, so they strip CR/LF from it and cap
+// its length.
+std::string unknown_command_error(std::string_view name);
+std::string wrong_arity_error(std::string_view name);
 
 }  // namespace mini_dragonfly::commands

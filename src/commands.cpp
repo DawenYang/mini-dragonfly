@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <optional>
+#include <string_view>
 #include <utility>
 
 #include "parse_int.hh"
@@ -17,7 +18,7 @@ namespace {
 // same as real Redis checks it inside its own pingCommand.
 std::string ping_handler(ShardStore&, std::vector<std::string>& args) {
     if (args.size() > 2) {
-        return "-ERR unknown command or wrong number of arguments\r\n";
+        return wrong_arity_error("ping");
     }
     if (args.size() == 2) {
         return resp::encode_bulk(std::optional(std::move(args[1])));
@@ -93,17 +94,83 @@ bool exists_handler(ShardStore& s, const std::string& key) {
 
 const std::unordered_map<std::string, CommandSpec>& table() {
     static const std::unordered_map<std::string, CommandSpec> table = {
-        {"PING", {-1, 0, 0, 0, LockMode::None, Handler{ping_handler}}},
-        {"ECHO", {2, 0, 0, 0, LockMode::None, Handler{echo_handler}}},
-        {"COMMAND", {-1, 0, 0, 0, LockMode::None, Handler{command_handler}}},
-        {"CONFIG", {-1, 0, 0, 0, LockMode::None, Handler{config_handler}}},
-        {"CLIENT", {-1, 0, 0, 0, LockMode::None, Handler{client_handler}}},
-        {"GET", {2, 1, 1, 1, LockMode::Read, Handler{get_handler}}},
-        {"SET", {3, 1, 1, 1, LockMode::Write, Handler{set_handler}}},
-        {"EXPIRE", {3, 1, 1, 1, LockMode::Write, Handler{expire_handler}}},
-        {"INCR", {2, 1, 1, 1, LockMode::Write, Handler{incr_handler}}},
-        {"DEL", {-2, 1, -1, 1, LockMode::Write, MultiKeyHandler{del_handler}}},
-        {"EXISTS", {-2, 1, -1, 1, LockMode::Read, MultiKeyHandler{exists_handler}}},
+        {"PING",
+         {.arity = -1,
+          .first_key = 0,
+          .last_key = 0,
+          .key_step = 0,
+          .lock_mode = LockMode::None,
+          .handler = Handler{ping_handler}}},
+        {"ECHO",
+         {.arity = 2,
+          .first_key = 0,
+          .last_key = 0,
+          .key_step = 0,
+          .lock_mode = LockMode::None,
+          .handler = Handler{echo_handler}}},
+        {"COMMAND",
+         {.arity = -1,
+          .first_key = 0,
+          .last_key = 0,
+          .key_step = 0,
+          .lock_mode = LockMode::None,
+          .handler = Handler{command_handler}}},
+        {"CONFIG",
+         {.arity = -1,
+          .first_key = 0,
+          .last_key = 0,
+          .key_step = 0,
+          .lock_mode = LockMode::None,
+          .handler = Handler{config_handler}}},
+        {"CLIENT",
+         {.arity = -1,
+          .first_key = 0,
+          .last_key = 0,
+          .key_step = 0,
+          .lock_mode = LockMode::None,
+          .handler = Handler{client_handler}}},
+        {"GET",
+         {.arity = 2,
+          .first_key = 1,
+          .last_key = 1,
+          .key_step = 1,
+          .lock_mode = LockMode::Read,
+          .handler = Handler{get_handler}}},
+        {"SET",
+         {.arity = 3,
+          .first_key = 1,
+          .last_key = 1,
+          .key_step = 1,
+          .lock_mode = LockMode::Write,
+          .handler = Handler{set_handler}}},
+        {"EXPIRE",
+         {.arity = 3,
+          .first_key = 1,
+          .last_key = 1,
+          .key_step = 1,
+          .lock_mode = LockMode::Write,
+          .handler = Handler{expire_handler}}},
+        {"INCR",
+         {.arity = 2,
+          .first_key = 1,
+          .last_key = 1,
+          .key_step = 1,
+          .lock_mode = LockMode::Write,
+          .handler = Handler{incr_handler}}},
+        {"DEL",
+         {.arity = -2,
+          .first_key = 1,
+          .last_key = -1,
+          .key_step = 1,
+          .lock_mode = LockMode::Write,
+          .handler = MultiKeyHandler{del_handler}}},
+        {"EXISTS",
+         {.arity = -2,
+          .first_key = 1,
+          .last_key = -1,
+          .key_step = 1,
+          .lock_mode = LockMode::Read,
+          .handler = MultiKeyHandler{exists_handler}}},
     };
     return table;
 }
@@ -111,6 +178,37 @@ const std::unordered_map<std::string, CommandSpec>& table() {
 bool arity_matches(int arity, size_t n) {
     const auto signed_n = static_cast<int>(n);
     return arity >= 0 ? signed_n == arity : signed_n >= -arity;
+}
+
+namespace {
+
+// Echoes at most this much of a client-supplied command name back in an
+// error, so a huge "command name" can't turn one error reply into a huge one.
+constexpr size_t kMaxEchoedNameLen = 128;
+
+// A command name is arbitrary client bytes; it must not be able to smuggle a
+// CR or LF into a RESP simple-error line and end it early.
+std::string printable_name(std::string_view name) {
+    std::string out(name.substr(0, kMaxEchoedNameLen));
+    for (char& c : out) {
+        if (c == '\r' || c == '\n') {
+            c = ' ';
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+std::string unknown_command_error(std::string_view name) {
+    return "-ERR unknown command '" + printable_name(name) + "'\r\n";
+}
+
+std::string wrong_arity_error(std::string_view name) {
+    std::string lower = printable_name(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return "-ERR wrong number of arguments for '" + lower + "' command\r\n";
 }
 
 std::string to_upper(std::string s) {

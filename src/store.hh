@@ -76,6 +76,19 @@ class ShardStoreImpl {
 public:
     using time_point = typename Clock::time_point;
 
+    // Not copyable: every Entry with a TTL holds an iterator into
+    // expiry_index_, so a copy would carry iterators pointing into the
+    // *source's* index, dangling the moment the source changed or died.
+    // Moving is safe -- moving a std::multimap or std::unordered_map hands
+    // over the same nodes rather than relocating them, so those iterators
+    // stay valid and point into the destination's (now-owned) index -- so
+    // it's allowed, spelled out here rather than left to the implicit rules.
+    ShardStoreImpl() = default;
+    ShardStoreImpl(const ShardStoreImpl&) = delete;
+    ShardStoreImpl& operator=(const ShardStoreImpl&) = delete;
+    ShardStoreImpl(ShardStoreImpl&&) = default;
+    ShardStoreImpl& operator=(ShardStoreImpl&&) = default;
+
     // A key past its expiry is treated as a miss and erased on access
     // (lazy expiration). sweep_expired() below additionally reclaims
     // expired keys that are never accessed again.
@@ -182,23 +195,45 @@ public:
         return {IncrOutcome::Status::Ok, next};
     }
 
-    // Actively removes every currently-expired key, rather than waiting
-    // for each one to be touched again -- intended to be called
-    // periodically from a background task (see ExpirySweeper), not on
-    // every request. expiry_index_ is kept ordered by expires_at, so this
-    // only ever visits keys that have actually expired (plus one
-    // upper_bound() lookup), rather than scanning the whole keyspace --
-    // cost is O(k log n) in the number of keys removed, not the number of
-    // keys that exist. Returns how many keys were removed.
-    size_t sweep_expired() {
+    // About 0.4 ms of work per batch at the ~190 ns/key measured for a
+    // 1M-key burst -- far under Seastar's reactor-stall warning threshold.
+    static constexpr size_t kDefaultSweepBatch = 2048;
+
+    struct SweepResult {
         size_t removed = 0;
-        const auto end = expiry_index_.upper_bound(Clock::now());
-        for (auto it = expiry_index_.begin(); it != end;) {
+        // True if expired keys were left behind because max_keys was hit.
+        // Call again (ideally after yielding to the reactor) to continue.
+        bool more = false;
+    };
+
+    // Actively removes currently-expired keys, rather than waiting for each
+    // one to be touched again -- intended to be called periodically from a
+    // background task (see ExpirySweeper), not on every request.
+    // expiry_index_ is kept ordered by expires_at, so this only ever visits
+    // keys that have actually expired, never the whole keyspace.
+    //
+    // Removes at most max_keys per call (at least 1; 0 is treated as 1 so a
+    // caller looping on `more` always makes progress). A burst of keys all
+    // expiring together would otherwise be one unbroken stretch of work
+    // proportional to the burst; bounding each call lets the caller yield
+    // between batches. No cursor is kept between calls -- the next call just
+    // starts from the front of the index again, which by then no longer
+    // holds the keys already removed.
+    SweepResult sweep_expired(size_t max_keys = kDefaultSweepBatch) {
+        max_keys = std::max<size_t>(max_keys, 1);
+        SweepResult result;
+        const time_point now = Clock::now();
+        auto it = expiry_index_.begin();
+        while (it != expiry_index_.end() && it->first <= now) {
+            if (result.removed == max_keys) {
+                result.more = true;
+                break;
+            }
             data_.erase(it->second);
             it = expiry_index_.erase(it);
-            ++removed;
+            ++result.removed;
         }
-        return removed;
+        return result;
     }
 
 private:

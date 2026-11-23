@@ -1,15 +1,14 @@
 #pragma once
 
-#include "store.hh"
-
+#include <cstdint>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/net/api.hh>
-
-#include <cstdint>
 #include <unordered_set>
+
+#include "store.hh"
 
 namespace mini_dragonfly {
 

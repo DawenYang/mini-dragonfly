@@ -3,6 +3,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <limits>
+#include <type_traits>
+#include <utility>
 
 #include "fake_clock.hh"
 
@@ -202,7 +204,7 @@ TEST_CASE("sweep_expired actively removes an expired key that's never been touch
     // Deliberately no get()/exists()/del() call here -- sweep_expired()
     // alone must find and remove it, to prove this is active expiry
     // rather than lazy expiry piggybacking on some other access.
-    REQUIRE(store.sweep_expired() == 1);
+    REQUIRE(store.sweep_expired().removed == 1);
 }
 
 TEST_CASE("sweep_expired leaves live keys alone and reports zero removed", "[store]") {
@@ -212,7 +214,7 @@ TEST_CASE("sweep_expired leaves live keys alone and reports zero removed", "[sto
     REQUIRE(store.expire("foo", 10));
 
     test_support::FakeClock::advance(std::chrono::seconds(5));
-    REQUIRE(store.sweep_expired() == 0);
+    REQUIRE(store.sweep_expired().removed == 0);
     REQUIRE(*store.get("foo") == "bar");
 }
 
@@ -226,7 +228,7 @@ TEST_CASE("sweep_expired removes only the keys that have actually expired", "[st
     REQUIRE(store.expire("long", 20));
 
     test_support::FakeClock::advance(std::chrono::seconds(10));
-    REQUIRE(store.sweep_expired() == 1);  // Only "short" has elapsed.
+    REQUIRE(store.sweep_expired().removed == 1);  // Only "short" has elapsed.
 
     REQUIRE_FALSE(store.get("short").has_value());
     REQUIRE(*store.get("long") == "b");
@@ -236,7 +238,7 @@ TEST_CASE("sweep_expired removes only the keys that have actually expired", "[st
 TEST_CASE("sweep_expired on an empty store does nothing", "[store]") {
     test_support::FakeClock::reset();
     FakeStore store;
-    REQUIRE(store.sweep_expired() == 0);
+    REQUIRE(store.sweep_expired().removed == 0);
 }
 
 // sweep_expired() is backed by an index ordered by expires_at (see
@@ -256,12 +258,12 @@ TEST_CASE("re-expiring a key replaces its old index entry instead of leaving it 
     REQUIRE(store.expire("foo", 5));    // Replaces it: now fires at t=5s.
 
     test_support::FakeClock::advance(std::chrono::seconds(6));
-    REQUIRE(store.sweep_expired() == 1);  // The t=5s entry, found and removed.
+    REQUIRE(store.sweep_expired().removed == 1);  // The t=5s entry, found and removed.
 
     test_support::FakeClock::advance(std::chrono::seconds(95));  // t=101s total.
     // If the old t=100s entry had survived the re-expire above, it would
     // show up here as a second (wrong) removal.
-    REQUIRE(store.sweep_expired() == 0);
+    REQUIRE(store.sweep_expired().removed == 0);
 }
 
 TEST_CASE("set() clearing a key's TTL removes its index entry, not just its visible expiry",
@@ -275,7 +277,7 @@ TEST_CASE("set() clearing a key's TTL removes its index entry, not just its visi
     test_support::FakeClock::advance(std::chrono::seconds(10));
     // A surviving stale index entry would make this wrongly find and
     // remove "foo", even though set() made it permanent again.
-    REQUIRE(store.sweep_expired() == 0);
+    REQUIRE(store.sweep_expired().removed == 0);
     REQUIRE(*store.get("foo") == "baz");
 }
 
@@ -287,5 +289,87 @@ TEST_CASE("del() on a key with a TTL removes its index entry too", "[store]") {
     REQUIRE(store.del("foo"));
 
     test_support::FakeClock::advance(std::chrono::seconds(10));
-    REQUIRE(store.sweep_expired() == 0);
+    REQUIRE(store.sweep_expired().removed == 0);
+}
+
+TEST_CASE("sweep_expired removes at most max_keys per call and reports whether more remain",
+          "[store]") {
+    test_support::FakeClock::reset();
+    FakeStore store;
+    constexpr int kKeys = 10'000;
+    constexpr size_t kBatch = 1'000;
+    for (int i = 0; i < kKeys; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        store.set(key, "v");
+        REQUIRE(store.expire(key, 5));
+    }
+    store.set("live", "v");  // No expiry -- must survive every batch.
+
+    test_support::FakeClock::advance(std::chrono::seconds(6));  // All kKeys expire together.
+
+    size_t total = 0;
+    int batches = 0;
+    FakeStore::SweepResult batch;
+    do {
+        batch = store.sweep_expired(kBatch);
+        REQUIRE(batch.removed <= kBatch);
+        total += batch.removed;
+        ++batches;
+    } while (batch.more);
+
+    REQUIRE(total == kKeys);
+    REQUIRE(batches == kKeys / static_cast<int>(kBatch));
+    REQUIRE(*store.get("live") == "v");
+}
+
+TEST_CASE("sweep_expired reports no more remaining when the batch limit lands exactly on the end",
+          "[store]") {
+    test_support::FakeClock::reset();
+    FakeStore store;
+    for (const char* key : {"a", "b", "c"}) {
+        store.set(key, "v");
+        REQUIRE(store.expire(key, 1));
+    }
+    test_support::FakeClock::advance(std::chrono::seconds(2));
+
+    const auto batch = store.sweep_expired(3);
+    REQUIRE(batch.removed == 3);
+    REQUIRE_FALSE(batch.more);
+}
+
+TEST_CASE("sweep_expired treats a max_keys of 0 as 1, so a loop on `more` still progresses",
+          "[store]") {
+    test_support::FakeClock::reset();
+    FakeStore store;
+    store.set("a", "v");
+    store.set("b", "v");
+    REQUIRE(store.expire("a", 1));
+    REQUIRE(store.expire("b", 1));
+    test_support::FakeClock::advance(std::chrono::seconds(2));
+
+    const auto batch = store.sweep_expired(0);
+    REQUIRE(batch.removed == 1);
+    REQUIRE(batch.more);
+}
+
+TEST_CASE("a store can't be copied but can be moved, keeping its expiry index intact", "[store]") {
+    static_assert(!std::is_copy_constructible_v<FakeStore>);
+    static_assert(!std::is_copy_assignable_v<FakeStore>);
+    static_assert(std::is_move_constructible_v<FakeStore>);
+    static_assert(std::is_move_assignable_v<FakeStore>);
+
+    test_support::FakeClock::reset();
+    FakeStore source;
+    source.set("foo", "bar");
+    REQUIRE(source.expire("foo", 5));
+
+    FakeStore moved(std::move(source));
+    FakeStore assigned;
+    assigned = std::move(moved);
+
+    // Entries' stored index iterators must still be valid in the new owner:
+    // re-expiring erases through one, and sweeping walks the index itself.
+    REQUIRE(assigned.expire("foo", 10));
+    test_support::FakeClock::advance(std::chrono::seconds(11));
+    REQUIRE(assigned.sweep_expired().removed == 1);
 }
