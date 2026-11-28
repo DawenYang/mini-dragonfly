@@ -11,6 +11,7 @@
 #include "server.hh"
 #include "stop_signal.hh"
 #include "store.hh"
+#include "tx_shard.hh"
 
 namespace {
 
@@ -36,16 +37,20 @@ int main(int argc, char** argv) {
             store.start().get();
             auto stop_store = seastar::deferred_stop(store);
 
-            // Declared (and so, on the way out, stopped) after store but
-            // before server: shutdown order is server, then sweeper, then
-            // store -- stopping the connection-handling and the periodic
-            // sweep before the store they both call into is torn down.
+            seastar::sharded<mini_dragonfly::TxShard> tx_shards;
+            tx_shards.start().get();
+            auto stop_tx_shards = seastar::deferred_stop(tx_shards);
+
+            // Declared (and so, on the way out, stopped) after the state
+            // above but before server: shutdown order is server, then
+            // sweeper, then transaction state, then store -- everything that
+            // calls into something is stopped before it is torn down.
             mini_dragonfly::ExpirySweeper sweeper(store, kExpirySweepInterval);
             sweeper.start();
             auto stop_sweeper = seastar::deferred_stop(sweeper);
 
             seastar::sharded<mini_dragonfly::TcpServer> server;
-            server.start(port, std::ref(store)).get();
+            server.start(port, std::ref(store), std::ref(tx_shards)).get();
             auto stop_server = seastar::deferred_stop(server);
 
             // invoke_on_all's start() calls seastar::listen() on every

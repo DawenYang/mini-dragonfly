@@ -526,3 +526,132 @@ TEST_CASE("accept() failures (e.g. EMFILE) don't kill the accept loop permanentl
     client.send("*1\r\n$4\r\nPING\r\n");
     REQUIRE(client.recv_at_least(7) == "+PONG\r\n");
 }
+
+TEST_CASE("MSET and MGET work across shards and keep the key order", "[server]") {
+    TestServerProcess server(/*smp=*/4);
+    TcpClient client("127.0.0.1", server.port());
+
+    client.send(
+        "*7\r\n$4\r\nMSET\r\n$5\r\nalpha\r\n$1\r\n1\r\n$5\r\nbravo\r\n$1\r\n2\r\n"
+        "$7\r\ncharlie\r\n$1\r\n3\r\n");
+    REQUIRE(client.recv_at_least(5) == "+OK\r\n");
+
+    client.send(
+        "*5\r\n$4\r\nMGET\r\n$7\r\ncharlie\r\n$7\r\nmissing\r\n$5\r\nalpha\r\n"
+        "$5\r\nbravo\r\n");
+    const std::string expected = "*4\r\n$1\r\n3\r\n$-1\r\n$1\r\n1\r\n$1\r\n2\r\n";
+    REQUIRE(client.recv_at_least(expected.size()) == expected);
+}
+
+TEST_CASE("MSET with a key missing its value is an arity error", "[server]") {
+    TestServerProcess server;
+    TcpClient client("127.0.0.1", server.port());
+
+    client.send("*4\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n");
+    const std::string expected = "-ERR wrong number of arguments for 'mset' command\r\n";
+    REQUIRE(client.recv_at_least(expected.size()) == expected);
+}
+
+namespace {
+
+std::string resp_command(const std::vector<std::string>& args) {
+    std::string out = "*" + std::to_string(args.size()) + "\r\n";
+    for (const std::string& arg : args) {
+        out += "$" + std::to_string(arg.size()) + "\r\n" + arg + "\r\n";
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("concurrent MSETs are atomic as seen by MGET across shards", "[server]") {
+    // Every writer sets all the keys to its own letter in one MSET, so any
+    // MGET observing two different letters saw half of a transaction. SETs
+    // on a separate key keep single-key traffic flowing alongside.
+    constexpr int kWriters = 4;
+    constexpr int kReaders = 4;
+    constexpr int kRounds = 300;
+    constexpr size_t kKeys = 8;
+
+    TestServerProcess server(/*smp=*/4);
+
+    std::vector<std::string> mget = {"MGET"};
+    for (size_t k = 0; k < kKeys; ++k) {
+        mget.push_back("key:" + std::to_string(k));
+    }
+    const auto mset = [&mget](char letter) {
+        std::vector<std::string> args = {"MSET"};
+        for (size_t k = 1; k < mget.size(); ++k) {
+            args.push_back(mget[k]);
+            args.emplace_back(1, letter);
+        }
+        return resp_command(args);
+    };
+    const auto uniform_reply = [](char letter) {
+        std::string reply = "*" + std::to_string(kKeys) + "\r\n";
+        for (size_t k = 0; k < kKeys; ++k) {
+            reply += std::string("$1\r\n") + letter + "\r\n";
+        }
+        return reply;
+    };
+
+    {
+        TcpClient setup("127.0.0.1", server.port());
+        setup.send(mset('A'));
+        REQUIRE(setup.recv_at_least(5) == "+OK\r\n");
+    }
+
+    // Catch2 assertions aren't thread-safe; threads only count failures.
+    std::atomic<int> torn_reads{0};
+    std::atomic<int> bad_writes{0};
+    std::atomic<int> bad_reads{0};
+    std::vector<std::thread> threads;
+    for (int w = 0; w < kWriters; ++w) {
+        threads.emplace_back([&, w] {
+            TcpClient client("127.0.0.1", server.port());
+            const char letter = static_cast<char>('A' + w);
+            for (int i = 0; i < kRounds; ++i) {
+                client.send(mset(letter));
+                if (client.recv_at_least(5) != "+OK\r\n") {
+                    ++bad_writes;
+                }
+                client.send(resp_command({"SET", "key:solo", "x"}));
+                if (client.recv_at_least(5) != "+OK\r\n") {
+                    ++bad_writes;
+                }
+            }
+        });
+    }
+    for (int r = 0; r < kReaders; ++r) {
+        threads.emplace_back([&] {
+            TcpClient client("127.0.0.1", server.port());
+            const std::string request = resp_command(mget);
+            const size_t reply_size = uniform_reply('A').size();
+            for (int i = 0; i < kRounds; ++i) {
+                client.send(request);
+                const std::string reply = client.recv_at_least(reply_size);
+                bool uniform = false;
+                for (int w = 0; w < kWriters; ++w) {
+                    uniform = uniform || reply == uniform_reply(static_cast<char>('A' + w));
+                }
+                if (!uniform) {
+                    ++torn_reads;
+                }
+                // A single-key read of a contested key has to queue behind
+                // the MSETs holding it.
+                client.send(resp_command({"GET", mget[1]}));
+                if (!client.recv_at_least(7).starts_with("$1\r\n")) {
+                    ++bad_reads;
+                }
+            }
+        });
+    }
+    for (std::thread& t : threads) {
+        t.join();
+    }
+
+    REQUIRE(torn_reads == 0);
+    REQUIRE(bad_writes == 0);
+    REQUIRE(bad_reads == 0);
+    REQUIRE(server.shutdown_and_wait());
+}

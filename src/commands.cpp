@@ -82,12 +82,38 @@ std::string incr_handler(ShardStore& s, std::vector<std::string>& args) {
     return resp::encode_integer(outcome.value);
 }
 
-bool del_handler(ShardStore& s, const std::string& key) {
-    return s.del(key);
+KeyResult del_key(ShardStore& s, std::vector<std::string>& args, size_t i) {
+    return s.del(args[i]) ? KeyResult(std::in_place) : std::nullopt;
 }
 
-bool exists_handler(ShardStore& s, const std::string& key) {
-    return s.exists(key);
+KeyResult exists_key(ShardStore& s, std::vector<std::string>& args, size_t i) {
+    return s.exists(args[i]) ? KeyResult(std::in_place) : std::nullopt;
+}
+
+KeyResult mget_key(ShardStore& s, std::vector<std::string>& args, size_t i) {
+    return s.get(args[i]);
+}
+
+KeyResult mset_key(ShardStore& s, std::vector<std::string>& args, size_t i) {
+    s.set(std::move(args[i]), std::move(args[i + 1]));
+    return std::nullopt;
+}
+
+std::string count_present(std::vector<KeyResult> results) {
+    return resp::encode_integer(
+        std::ranges::count_if(results, [](const KeyResult& r) { return r.has_value(); }));
+}
+
+std::string bulk_array(std::vector<KeyResult> results) {
+    std::string reply = "*" + std::to_string(results.size()) + "\r\n";
+    for (const KeyResult& result : results) {
+        reply += resp::encode_bulk(result);
+    }
+    return reply;
+}
+
+std::string always_ok(std::vector<KeyResult>) {
+    return "+OK\r\n";
 }
 
 }  // namespace
@@ -163,14 +189,28 @@ const std::unordered_map<std::string, CommandSpec>& table() {
           .last_key = -1,
           .key_step = 1,
           .lock_mode = LockMode::Write,
-          .handler = MultiKeyHandler{del_handler}}},
+          .handler = MultiKeyHandler{del_key, count_present}}},
         {"EXISTS",
          {.arity = -2,
           .first_key = 1,
           .last_key = -1,
           .key_step = 1,
           .lock_mode = LockMode::Read,
-          .handler = MultiKeyHandler{exists_handler}}},
+          .handler = MultiKeyHandler{exists_key, count_present}}},
+        {"MGET",
+         {.arity = -2,
+          .first_key = 1,
+          .last_key = -1,
+          .key_step = 1,
+          .lock_mode = LockMode::Read,
+          .handler = MultiKeyHandler{mget_key, bulk_array}}},
+        {"MSET",
+         {.arity = -3,
+          .first_key = 1,
+          .last_key = -1,
+          .key_step = 2,
+          .lock_mode = LockMode::Write,
+          .handler = MultiKeyHandler{mset_key, always_ok}}},
     };
     return table;
 }
@@ -178,6 +218,29 @@ const std::unordered_map<std::string, CommandSpec>& table() {
 bool arity_matches(int arity, size_t n) {
     const auto signed_n = static_cast<int>(n);
     return arity >= 0 ? signed_n == arity : signed_n >= -arity;
+}
+
+bool arity_matches(const CommandSpec& spec, size_t n) {
+    if (!arity_matches(spec.arity, n)) {
+        return false;
+    }
+    if (spec.first_key == 0 || spec.last_key != -1) {
+        return true;
+    }
+    return (n - static_cast<size_t>(spec.first_key)) % static_cast<size_t>(spec.key_step) == 0;
+}
+
+std::vector<size_t> key_indices(const CommandSpec& spec, size_t n) {
+    std::vector<size_t> indices;
+    if (spec.first_key == 0) {
+        return indices;
+    }
+    const size_t last = spec.last_key == -1 ? n - 1 : static_cast<size_t>(spec.last_key);
+    for (auto i = static_cast<size_t>(spec.first_key); i <= last;
+         i += static_cast<size_t>(spec.key_step)) {
+        indices.push_back(i);
+    }
+    return indices;
 }
 
 namespace {

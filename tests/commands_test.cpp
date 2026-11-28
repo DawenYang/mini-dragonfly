@@ -4,11 +4,13 @@
 #include <string>
 #include <vector>
 
+using mini_dragonfly::LockMode;
 using mini_dragonfly::ShardStore;
 using mini_dragonfly::commands::arity_matches;
 using mini_dragonfly::commands::CommandSpec;
 using mini_dragonfly::commands::Handler;
-using mini_dragonfly::commands::LockMode;
+using mini_dragonfly::commands::key_indices;
+using mini_dragonfly::commands::KeyResult;
 using mini_dragonfly::commands::MultiKeyHandler;
 using mini_dragonfly::commands::table;
 using mini_dragonfly::commands::to_upper;
@@ -30,18 +32,23 @@ CommandSpec spec_for(const std::string& name) {
 }
 
 // Calls a single-key (or keyless) command's handler directly, the same
-// way Connection::execute() does in server.cpp, without any Seastar
+// way execute_command() does, without any Seastar
 // involvement.
 std::string run(const std::string& name, std::vector<std::string> args, ShardStore& store) {
     const Handler handler = std::get<Handler>(spec_for(name).handler);
     return handler(store, args);
 }
 
-// Calls a multi-key command's handler for one key, the same way
-// Connection::execute() does per key in its multi-key path.
-bool run_multi(const std::string& name, const std::string& key, ShardStore& store) {
-    const MultiKeyHandler handler = std::get<MultiKeyHandler>(spec_for(name).handler);
-    return handler(store, key);
+// Runs a multi-key command the way execute_command() does, with every key
+// on the one given store.
+std::string run_multi(const std::string& name, std::vector<std::string> args, ShardStore& store) {
+    const CommandSpec spec = spec_for(name);
+    const MultiKeyHandler handler = std::get<MultiKeyHandler>(spec.handler);
+    std::vector<KeyResult> results;
+    for (const size_t i : key_indices(spec, args.size())) {
+        results.push_back(handler.per_key(store, args, i));
+    }
+    return handler.combine(std::move(results));
 }
 
 }  // namespace
@@ -172,24 +179,48 @@ TEST_CASE("INCR on a non-integer value is an error", "[commands]") {
             "-ERR value is not an integer or out of range\r\n");
 }
 
-TEST_CASE("DEL's per-key handler removes a live key and returns true", "[commands]") {
+TEST_CASE("DEL removes live keys and counts only those", "[commands]") {
     ShardStore store;
     run("SET", {"SET", "foo", "bar"}, store);
-    REQUIRE(run_multi("DEL", "foo", store));
+    REQUIRE(run_multi("DEL", {"DEL", "foo", "missing", "foo"}, store) == ":1\r\n");
     REQUIRE(run("GET", {"GET", "foo"}, store) == "$-1\r\n");
 }
 
-TEST_CASE("DEL's per-key handler on a missing key returns false", "[commands]") {
-    ShardStore store;
-    REQUIRE_FALSE(run_multi("DEL", "missing", store));
-}
-
-TEST_CASE("EXISTS's per-key handler reflects liveness without removing the key", "[commands]") {
+TEST_CASE("EXISTS counts live keys without removing them", "[commands]") {
     ShardStore store;
     run("SET", {"SET", "foo", "bar"}, store);
-    REQUIRE(run_multi("EXISTS", "foo", store));
+    REQUIRE(run_multi("EXISTS", {"EXISTS", "foo", "missing", "foo"}, store) == ":2\r\n");
     REQUIRE(run("GET", {"GET", "foo"}, store) == "$3\r\nbar\r\n");
-    REQUIRE_FALSE(run_multi("EXISTS", "missing", store));
+}
+
+TEST_CASE("MSET sets every pair and MGET returns them in order", "[commands]") {
+    ShardStore store;
+    REQUIRE(run_multi("MSET", {"MSET", "a", "1", "b", "", "a", "3"}, store) == "+OK\r\n");
+    REQUIRE(run_multi("MGET", {"MGET", "b", "missing", "a"}, store) ==
+            "*3\r\n$0\r\n\r\n$-1\r\n$1\r\n3\r\n");
+}
+
+TEST_CASE("MSET rejects a key without a value", "[commands]") {
+    const CommandSpec spec = spec_for("MSET");
+    REQUIRE_FALSE(arity_matches(spec, 1));
+    REQUIRE_FALSE(arity_matches(spec, 2));
+    REQUIRE(arity_matches(spec, 3));
+    REQUIRE_FALSE(arity_matches(spec, 4));
+    REQUIRE(arity_matches(spec, 5));
+}
+
+TEST_CASE("key_indices follows first_key, last_key and key_step", "[commands]") {
+    REQUIRE(key_indices(spec_for("PING"), 2).empty());
+    REQUIRE(key_indices(spec_for("SET"), 3) == std::vector<size_t>{1});
+    REQUIRE(key_indices(spec_for("DEL"), 4) == std::vector<size_t>{1, 2, 3});
+    REQUIRE(key_indices(spec_for("MSET"), 5) == std::vector<size_t>{1, 3});
+}
+
+TEST_CASE("exactly the commands with keys declare a lock mode", "[commands]") {
+    for (const auto& [name, spec] : table()) {
+        INFO(name);
+        REQUIRE((spec.first_key == 0) == (spec.lock_mode == LockMode::None));
+    }
 }
 
 TEST_CASE("COMMAND replies with an empty array stub", "[commands]") {

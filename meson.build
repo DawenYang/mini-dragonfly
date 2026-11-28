@@ -52,6 +52,7 @@ mini_dragonfly_exe = executable('mini-dragonfly',
     'src/expiry_sweeper.cpp',
     'src/resp.cpp',
     'src/server.cpp',
+    'src/transaction.cpp',
     include_directories : src_inc,
     dependencies : seastar_dep,
     install : true)
@@ -64,6 +65,7 @@ test_exe = executable('mini-dragonfly-tests',
     'tests/resp_test.cpp',
     'tests/store_test.cpp',
     'tests/commands_test.cpp',
+    'tests/tx_shard_test.cpp',
     'src/commands.cpp',
     'src/resp.cpp',
     include_directories : src_inc,
@@ -86,6 +88,7 @@ integration_test_exe = executable('mini-dragonfly-integration-tests',
 
 test('integration', integration_test_exe,
     env : {'MINI_DRAGONFLY_BIN' : mini_dragonfly_exe.full_path()},
+    depends : mini_dragonfly_exe,
     timeout : 60)
 
 run_target('format',

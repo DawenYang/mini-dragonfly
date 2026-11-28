@@ -1,26 +1,22 @@
 #include "server.hh"
 
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
-#include <functional>
 #include <optional>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/core/smp.hh>
-#include <seastar/core/when_all.hh>
 #include <seastar/util/log.hh>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "commands.hh"
 #include "resp.h"
+#include "transaction.hh"
 
 namespace mini_dragonfly {
 
@@ -32,21 +28,19 @@ constexpr auto kShutdownGracePeriod = std::chrono::seconds(2);
 constexpr auto kShutdownPollInterval = std::chrono::milliseconds(20);
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(100);
 
-// Which shard owns a given key. Lives here (not in ShardStore) since it's
-// routing logic, not storage logic -- keeps ShardStore itself free of any
-// Seastar dependency so it can be unit-tested without a reactor.
-unsigned owner_shard(const std::string& key) {
-    return static_cast<unsigned>(std::hash<std::string>{}(key) % seastar::smp::count);
-}
-
 }  // namespace
 
 namespace detail {
 
 class Connection {
 public:
-    Connection(seastar::connected_socket socket, seastar::sharded<ShardStore>& store)
-        : socket_(std::move(socket)), in_(socket_.input()), out_(socket_.output()), store_(store) {}
+    Connection(seastar::connected_socket socket, seastar::sharded<ShardStore>& store,
+               seastar::sharded<TxShard>& tx_shards)
+        : socket_(std::move(socket)),
+          in_(socket_.input()),
+          out_(socket_.output()),
+          store_(store),
+          tx_shards_(tx_shards) {}
 
     seastar::future<> handle() {
         return seastar::do_until([this] { return stop_; }, [this] { return process_one(); })
@@ -152,65 +146,27 @@ private:
         if (it == table.end()) {
             return out_.write(commands::unknown_command_error(args[0]));
         }
-        if (!commands::arity_matches(it->second.arity, args.size())) {
+        if (!commands::arity_matches(it->second, args.size())) {
             return out_.write(commands::wrong_arity_error(args[0]));
         }
         return execute(it->second, std::move(args));
     }
 
-    // Resolves this command's key(s) from spec.first_key/last_key/key_step,
-    // routes to the owning shard(s) via Seastar's own cross-shard messaging
-    // (sharded<T>::invoke_on, backed by smp_message_queue -- if a key's
-    // shard happens to be this one, Seastar calls through directly without
-    // going through the queue at all), and writes the reply. Does not
-    // flush -- parse_next_command() does that once, right before it would
-    // otherwise block waiting for more input, so a pipelined batch of
-    // commands costs one flush instead of one per command; handle()'s
-    // cleanup closing out_ covers the final reply too.
-    //
-    // A command with no keys at all (spec.first_key == 0) still goes
-    // through here, just routed to whichever shard is already running it
-    // -- so there's exactly one path below for "no keys", "one key", and
-    // "many keys", rather than a separate one per shape.
+    // Runs the command as a transaction (see transaction.hh) and writes the
+    // reply. Does not flush -- parse_next_command() does that once, right
+    // before it would otherwise block waiting for more input, so a pipelined
+    // batch of commands costs one flush instead of one per command;
+    // handle()'s cleanup closing out_ covers the final reply too.
     seastar::future<> execute(const commands::CommandSpec& spec, std::vector<std::string> args) {
-        if (const auto* handler = std::get_if<commands::Handler>(&spec.handler)) {
-            const unsigned shard = spec.first_key == 0
-                                       ? seastar::this_shard_id()
-                                       : owner_shard(args[static_cast<size_t>(spec.first_key)]);
-            const commands::Handler h = *handler;
-            return store_
-                .invoke_on(shard, [args = std::move(args),
-                                   h](ShardStore& s) mutable { return h(s, args); })
-                .then([this](std::string reply) { return out_.write(std::move(reply)); });
-        }
-
-        const auto multi_handler = std::get<commands::MultiKeyHandler>(spec.handler);
-        const auto first = static_cast<size_t>(spec.first_key);
-        const auto last =
-            spec.last_key == -1 ? args.size() - 1 : static_cast<size_t>(spec.last_key);
-        const auto step = static_cast<size_t>(spec.key_step);
-
-        std::vector<seastar::future<bool>> futures;
-        futures.reserve((last - first) / step + 1);
-        for (size_t i = first; i <= last; i += step) {
-            std::string key = std::move(args[i]);
-            const unsigned shard = owner_shard(key);
-            futures.push_back(
-                store_.invoke_on(shard, [key = std::move(key), multi_handler](ShardStore& s) {
-                    return multi_handler(s, key);
-                }));
-        }
-        return seastar::when_all_succeed(std::move(futures))
-            .then([this](std::vector<bool> results) {
-                const long long count = std::count(results.begin(), results.end(), true);
-                return out_.write(resp::encode_integer(count));
-            });
+        return execute_command(store_, tx_shards_, spec, std::move(args))
+            .then([this](std::string reply) { return out_.write(std::move(reply)); });
     }
 
     seastar::connected_socket socket_;
     seastar::input_stream<char> in_;
     seastar::output_stream<char> out_;
     seastar::sharded<ShardStore>& store_;
+    seastar::sharded<TxShard>& tx_shards_;
     // Unbounded: a client can declare a single bulk argument up to
     // resp.cpp's kMaxBulkLen (512 MB), and this grows to hold it while the
     // rest of that argument's bytes trickle in -- there's no cap here tied
@@ -231,8 +187,9 @@ private:
 
 using detail::Connection;
 
-TcpServer::TcpServer(uint16_t port, seastar::sharded<ShardStore>& store)
-    : port_(port), store_(store) {}
+TcpServer::TcpServer(uint16_t port, seastar::sharded<ShardStore>& store,
+                     seastar::sharded<TxShard>& tx_shards)
+    : port_(port), store_(store), tx_shards_(tx_shards) {}
 
 // Declared out-of-line (rather than left implicit) so that TUs which only
 // see the Connection forward declaration in server.hh -- e.g. main.cpp,
@@ -254,7 +211,8 @@ seastar::future<> TcpServer::accept_loop() {
             .then([this](seastar::accept_result ar) {
                 applog.info("accepted connection from {} on shard {}", ar.remote_address,
                             seastar::this_shard_id());
-                auto conn = seastar::make_lw_shared<Connection>(std::move(ar.connection), store_);
+                auto conn = seastar::make_lw_shared<Connection>(std::move(ar.connection), store_,
+                                                                tx_shards_);
                 connections_.insert(conn);
                 connections_gate_.enter();
                 (void)conn->handle()

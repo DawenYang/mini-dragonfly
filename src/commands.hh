@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -8,15 +9,9 @@
 #include <vector>
 
 #include "store.hh"
+#include "tx_shard.hh"
 
 namespace mini_dragonfly::commands {
-
-// What the transaction layer should acquire for this command's key(s)
-// before running it. Not enforced anywhere yet (there's no transaction
-// layer yet to enforce it) -- declared per-command here so that layer can
-// be added later without re-deriving this information for every command
-// again from scratch.
-enum class LockMode { None, Read, Write };
 
 // Runs once, given the full parsed command (args[0] is the command name
 // itself) and the ShardStore that owns this command's one key -- or, for
@@ -27,10 +22,25 @@ enum class LockMode { None, Read, Write };
 // out of it instead of copying; it's only ever used for this one call.
 using Handler = std::string (*)(ShardStore&, std::vector<std::string>& args);
 
-// Runs once per key for a command whose keys are a flat, step-1 list with
-// no other arguments (DEL, EXISTS, ...). The executor sums the per-key
-// results into a single RESP integer reply -- see CommandSpec::handler.
-using MultiKeyHandler = bool (*)(ShardStore&, const std::string& key);
+// What one key contributed to a multi-key command's reply. Empty means
+// "nothing" (a missing key for MGET or DEL).
+using KeyResult = std::optional<std::string>;
+
+// Runs once per key, on the shard owning args[key_index]. It may only touch
+// that key's own arguments, args[key_index, key_index + key_step), and may
+// move out of them: other shards are working on the rest of args at the
+// same time.
+using KeyHandler = KeyResult (*)(ShardStore&, std::vector<std::string>& args, size_t key_index);
+
+// Turns every key's result, in the order the keys were given, into the
+// complete RESP reply.
+using Combiner = std::string (*)(std::vector<KeyResult> results);
+
+// A command whose number of keys varies (DEL, MGET, MSET, ...).
+struct MultiKeyHandler {
+    KeyHandler per_key;
+    Combiner combine;
+};
 
 struct CommandSpec {
     // Redis's own convention: a positive value is the exact number of
@@ -50,12 +60,14 @@ struct CommandSpec {
     int last_key;
     int key_step;
 
+    // How the transaction layer locks this command's keys. None if and only
+    // if first_key == 0.
     LockMode lock_mode;
 
     // Exactly one of these is active: Handler for a command with at most
     // one key (first_key == 0, or first_key == last_key), MultiKeyHandler
     // for one with a variable-length list of them (last_key == -1). The
-    // executor (Connection::execute() in server.cpp) picks its path from
+    // executor (execute_command() in transaction.cpp) picks its path from
     // which alternative is engaged, and uses first_key/last_key/key_step
     // to find the keys -- so the two must agree, which commands_test.cpp
     // checks for every table entry.
@@ -68,6 +80,14 @@ const std::unordered_map<std::string, CommandSpec>& table();
 // satisfies arity under the Redis convention described on
 // CommandSpec::arity above.
 bool arity_matches(int arity, size_t n);
+
+// As above, and also rejects an incomplete trailing key group, such as an
+// MSET key without a value.
+bool arity_matches(const CommandSpec& spec, size_t n);
+
+// Positions of the key arguments in a command of n arguments. n must satisfy
+// arity_matches(spec, n).
+std::vector<size_t> key_indices(const CommandSpec& spec, size_t n);
 
 std::string to_upper(std::string s);
 

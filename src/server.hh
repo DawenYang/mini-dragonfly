@@ -9,6 +9,7 @@
 #include <unordered_set>
 
 #include "store.hh"
+#include "tx_shard.hh"
 
 namespace mini_dragonfly {
 
@@ -18,7 +19,8 @@ class Connection;
 
 class TcpServer {
 public:
-    TcpServer(uint16_t port, seastar::sharded<ShardStore>& store);
+    TcpServer(uint16_t port, seastar::sharded<ShardStore>& store,
+              seastar::sharded<TxShard>& tx_shards);
     // Declared out-of-line since it must be defined where Connection (only
     // forward-declared here) is a complete type -- see server.cpp.
     ~TcpServer();
@@ -31,6 +33,7 @@ private:
 
     uint16_t port_;
     seastar::sharded<ShardStore>& store_;
+    seastar::sharded<TxShard>& tx_shards_;
     seastar::server_socket listener_;
     // Set only once seastar::listen() in start() actually succeeds --
     // listener_ stays default-constructed (no underlying impl) if it
